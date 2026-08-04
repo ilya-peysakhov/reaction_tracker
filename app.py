@@ -96,10 +96,10 @@ def run_pipeline(board_url: str, days_back: int, delay: float):
                 thread_summaries.append(
                     ThreadMetric(title=title, url=full_url, total_reactions=thread_reactions)
                 )
-                if len(thread_summaries) >= 10:
-                    status.write("🧪 Test limit reached: Scraped 10 threads.")
-                    stop_scraping = True
-                    break
+                # if len(thread_summaries) >= 10:
+                #     status.write("🧪 Test limit reached: Scraped 10 threads.")
+                #     stop_scraping = True
+                #     break
 
             board_page += 1
 
