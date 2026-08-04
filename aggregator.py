@@ -1,46 +1,48 @@
-from collections import defaultdict
-from typing import List
+from collections import Counter
+from typing import List, Tuple
 from models import PostMetric, ThreadMetric, AggregatedMetrics
 
+
 class MetricsAggregator:
-    @staticmethod
-    def process(
-        scraped_posts: List[PostMetric],
-        thread_summaries: List[ThreadMetric]
-    ) -> AggregatedMetrics:
-        """Processes collected raw metrics into dashboard-ready totals."""
-        reactor_counts = defaultdict(int)
-        getter_counts = defaultdict(int)
+    def __init__(self, posts: List[PostMetric], threads: List[ThreadMetric]):
+        self.posts = posts
+        self.threads = threads
 
-        total_reactions = 0
-        for post in scraped_posts:
-            total_reactions += post.reaction_count
-            getter_counts[post.author] += post.reaction_count
+    def get_top_reaction_givers(self, limit: int = 10) -> List[Tuple[str, int]]:
+        """
+        Counts reactions given by user across all scraped posts.
+        """
+        giver_counts = Counter()
+        for post in self.posts:
             for reactor in post.reactors:
-                reactor_counts[reactor] += 1
+                giver_counts[reactor] += 1
+        return giver_counts.most_common(limit)
 
-        top_reactor = ("N/A", 0)
-        if reactor_counts:
-            best_reactor = max(reactor_counts, key=reactor_counts.get)
-            top_reactor = (best_reactor, reactor_counts[best_reactor])
+    def get_top_reaction_getters(self, limit: int = 10) -> List[Tuple[str, int]]:
+        """
+        Counts total reactions received by post author across all scraped posts.
+        """
+        getter_counts = Counter()
+        for post in self.posts:
+            if post.reaction_count > 0:
+                getter_counts[post.author] += post.reaction_count
+        return getter_counts.most_common(limit)
 
-        top_getter = ("N/A", 0)
-        if getter_counts:
-            best_getter = max(getter_counts, key=getter_counts.get)
-            top_getter = (best_getter, getter_counts[best_getter])
+    def get_most_reacted_posts(self, limit: int = 10) -> List[PostMetric]:
+        """
+        Returns posts sorted by highest reaction count.
+        """
+        return sorted(self.posts, key=lambda p: p.reaction_count, reverse=True)[:limit]
 
-        most_reacted_post = (
-            max(scraped_posts, key=lambda x: x.reaction_count) if scraped_posts else None
-        )
-        most_reacted_thread = (
-            max(thread_summaries, key=lambda x: x.total_reactions) if thread_summaries else None
-        )
-
+    def get_summary_metrics(() -> AggregatedMetrics:
+        """
+        Returns a dataclass containing all compiled dashboard metrics.
+        """
+        total_rxns = sum(t.total_reactions for t in self.threads)
         return AggregatedMetrics(
-            threads_scraped=len(thread_summaries),
-            total_reactions=total_reactions,
-            top_reactor=top_reactor,
-            top_getter=top_getter,
-            most_reacted_post=most_reacted_post,
-            most_reacted_thread=most_reacted_thread,
+            top_givers=self.get_top_reaction_givers(),
+            top_getters=self.get_top_reaction_getters(),
+            most_reacted_posts=self.get_most_reacted_posts(),
+            total_posts=len(self.posts),
+            total_reactions=total_rxns,
         )
