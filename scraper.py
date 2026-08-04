@@ -98,35 +98,44 @@ class XenForoScraper:
                 pass
         return None
 
+
+
     def extract_post_reactions(self, post_soup) -> Tuple[int, List[str]]:
         """
-        Parses reaction totals and reactor usernames from XenForo DOM structure on IGN.
+        Parses total reaction counts and named reactors from XenForo's DOM structure.
+        Correctly accounts for XenForo's 'and X others' truncation text.
         """
         reaction_count = 0
         reactors = []
-
-        # IGN XenForo active reaction bar
+    
+        # Find the active reaction bar container
         reaction_bar = post_soup.select_one(".reactionsBar.is-active, .js-reactionsList.is-active")
-        if reaction_bar:
-            # Extract reactor usernames from member profile links inside the reaction bar
-            member_links = reaction_bar.select("a.reactionsBar-link, a[href*='/members/']")
-            for link in member_links:
-                username = link.get_text(strip=True)
-                if username and username not in reactors:
+        if not reaction_bar:
+            return 0, []
+    
+        # 1. Extract named member profile links inside the reaction bar
+        member_links = reaction_bar.select("a[href*='/members/'], a.reactionsBar-link")
+        for link in member_links:
+            username = link.get_text(strip=True)
+            # Filter out navigation links like 'and 3 others' if captured by reactionsBar-link
+            if username and not re.search(r"\b\d+\s+other", username, re.IGNORECASE):
+                if username not in reactors:
                     reactors.append(username)
-
-            # Count total reactors or extract explicit count indicator if present
-            count_elem = reaction_bar.select_one(".u-srOnly, .reactionsBar-link--count")
-            if count_elem:
-                digits = re.findall(r"\d+", count_elem.get_text())
-                if digits:
-                    reaction_count = int(digits[0])
-                else:
-                    reaction_count = len(reactors)
-            else:
-                # If no explicit numerical count pill is shown, count of listed reactor links equals total reactions
-                reaction_count = len(reactors) if reactors else 1
-
+    
+        # 2. Get full text of the reaction bar (e.g., "In_The_Fade, tarhaun and 5 others")
+        bar_text = reaction_bar.get_text(" ", strip=True)
+    
+        # 3. Check for XenForo's "and X other(s)" pattern
+        others_match = re.search(r"and\s+(\d+)\s+other", bar_text, re.IGNORECASE)
+    
+        if others_match:
+            # Total = named visible reactors + numerical 'others' count
+            additional_count = int(others_match.group(1))
+            reaction_count = len(reactors) + additional_count
+        else:
+            # Fallback to total visible reactor usernames or 1 if bar is active
+            reaction_count = len(reactors) if reactors else 1
+    
         return reaction_count, reactors
 
     def get_last_page_number(
