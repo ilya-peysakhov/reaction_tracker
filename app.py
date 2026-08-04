@@ -1,204 +1,171 @@
-import time
-from datetime import datetime, timedelta, timezone
-import pandas as pd
+from datetime import datetime, timedelta
+import re
 import streamlit as st
-from bs4 import BeautifulSoup
+import pandas as pd
 
+from scraper import IGNScraper
 from aggregator import MetricsAggregator
-from models import PostMetric, ThreadMetric
-from scraper import BASE_URL, XenForoScraper
+from models import ThreadMetric, PostMetric
 
+# Page Configuration
 st.set_page_config(
-    page_title="IGN Boards Reaction Tracker",
-    page_icon="📊",
-    layout="wide",
+    page_title="IGN Boards Analytics",
+    page_icon="🔥",
+    layout="wide"
 )
 
+# -----------------------------------------------------------------------------
+# CACHED DATA PIPELINE
+# -----------------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_board_data(board_url: str, days_back: int, max_threads_limit: int = 10):
+    """
+    Scrapes threads and posts from an IGN Board category.
+    Cached for 1 hour (3600s) to prevent redundant HTTP requests.
+    """
+    scraper = IGNScraper()
+    cutoff_date = datetime.now() - timedelta(days=days_back)
+    
+    all_posts = []
+    thread_summaries = []
+    
+    # 1. Fetch board index
+    threads = scraper.get_board_threads(board_url)
+    
+    for thread in threads:
+        # Check thread timestamp for cutoff
+        latest_time_tag = thread.select_one(".structItem-cell--latest time.u-dt")
+        latest_date = scraper.parse_time(latest_time_tag)
 
-def run_pipeline(board_url: str, days_back: int, delay: float):
-    scraper = XenForoScraper(base_delay=delay)
-    cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_back)
+        if latest_date and latest_date < cutoff_date:
+            break
 
-    all_posts: list[PostMetric] = []
-    thread_summaries: list[ThreadMetric] = []
+        title_tag = thread.select_one(
+            ".structItem-title a[data-tp-primary='on'], .structItem-title a[href*='/threads/']"
+        )
+        if not title_tag:
+            continue
 
-    board_page = 1
-    stop_scraping = False
-    consecutive_errors = 0
-    MAX_ERRORS = 3
+        title = title_tag.get_text(strip=True)
+        href = title_tag["href"]
+        full_url = scraper.BASE_URL + href if href.startswith("/") else href
 
-    with st.status("Initializing resilient scraper pipeline...", expanded=True) as status:
-        while not stop_scraping:
-            page_url = (
-                f"{board_url}page-{board_page}"
-                if board_page > 1
-                else board_url
-            )
-            status.update(
-                label=f"Scanning Index Page {board_page}...", state="running"
-            )
+        # Check for page jump indicators
+        last_page = 1
+        page_jump_links = thread.select(".structItem-pageJump a")
+        if page_jump_links:
+            last_link_text = page_jump_links[-1].get_text(strip=True)
+            if last_link_text.isdigit():
+                last_page = int(last_link_text)
 
-            res = scraper.fetch_url(page_url)
-            if not res:
-                consecutive_errors += 1
-                status.write(f"⚠️ Warning: Request failed or rate limited on index page {board_page}. ({consecutive_errors}/{MAX_ERRORS})")
-                
-                if consecutive_errors >= MAX_ERRORS:
-                    status.write("🛑 Circuit breaker tripped due to consecutive failures. Saving partial results.")
-                    break
-                continue
-            
-            consecutive_errors = 0
-            soup = BeautifulSoup(res.text, "html.parser")
-            threads = soup.select(".structItem--thread")
-            if not threads:
-                break
-
-            for thread in threads:
-                latest_time_tag = thread.select_one(".structItem-cell--latest time.u-dt")
-                latest_date = scraper.parse_time(latest_time_tag)
-
-                if latest_date and latest_date < cutoff_date:
-                    status.write(f"⏰ Reached thread past {days_back}-day cutoff date. Stopping index crawl.")
-                    stop_scraping = True
-                    break
-
-                title_tag = thread.select_one(".structItem-title a[data-tp-primary='on'], .structItem-title a[href*='/threads/']")
-                if not title_tag:
-                    continue
-
-                title = title_tag.get_text(strip=True)
-                href = title_tag["href"]
-                full_url = BASE_URL + href if href.startswith("/") else href
-
-                # --- START: REVERSE PAGINATION EXTRACTION ---
-                last_page = 1
-                page_jump_links = thread.select(".structItem-pageJump a")
-                if page_jump_links:
-                    last_link_text = page_jump_links[-1].get_text(strip=True)
-                    if last_link_text.isdigit():
-                        last_page = int(last_link_text)
-
-                status.write(f"Scraping thread (Pg {last_page} ➔ 1): **{title[:35]}...**")
-                
-                # Execute reverse scraper starting from last_page
-                posts = scraper.scrape_thread_backwards(
-                    full_url, cutoff_date, initial_max_page=last_page
-                )
-                # --- END: REVERSE PAGINATION EXTRACTION ---
-
-                thread_reactions = 0
-                for post in posts:
-                    post.thread_title = title
-                    thread_reactions += post.reaction_count
-                    all_posts.append(post)
-
-                thread_summaries.append(
-                    ThreadMetric(title=title, url=full_url, total_reactions=thread_reactions)
-                )
-                # if len(thread_summaries) >= 10:
-                #     status.write("🧪 Test limit reached: Scraped 10 threads.")
-                #     stop_scraping = True
-                #     break
-
-            board_page += 1
-
-        status.update(
-            label="Scraping successfully completed!", state="complete", expanded=False
+        # Scrape thread posts backwards from the last page
+        posts = scraper.scrape_thread_backwards(
+            full_url, cutoff_date, initial_max_page=last_page
         )
 
-    return MetricsAggregator.process(all_posts, thread_summaries), all_posts
+        thread_reactions = 0
+        for post in posts:
+            post.thread_title = title
+            thread_reactions += post.reaction_count
+            all_posts.append(post)
 
-
-# --- UI LAYOUT ---
-st.title("📊 IGN Boards Reaction Tracker")
-st.caption("Automated XenForo analytics engine with reverse thread traversal.")
-
-with st.sidebar:
-    st.header("⚙️ Configuration")
-    url_input = st.text_input(
-        "Board Base URL",
-        "https://www.ignboards.com/forums/the-vestibule.5296/",
-    )
-
-    days_option = st.pills(
-        "Lookback Window",
-        options=[1, 3, 7, 14],
-        default=7,
-        format_func=lambda x: f"{x} Days",
-    )
-    days = days_option if days_option else 7
-
-    with st.popover("🔧 Advanced Network Settings"):
-        request_delay = st.slider(
-            "Request Delay (Seconds)",
-            min_value=0.5,
-            max_value=5.0,
-            value=1.0,
-            step=0.5,
+        thread_summaries.append(
+            ThreadMetric(title=title, url=full_url, total_reactions=thread_reactions)
         )
 
-    run_button = st.button("Run Analytics Engine", type="primary")
+        # --- TEST LIMIT CAP ---
+        if max_threads_limit and len(thread_summaries) >= max_threads_limit:
+            break
 
-if run_button:
-    metrics, raw_posts = run_pipeline(url_input, days, request_delay)
-    st.session_state["metrics"] = metrics
-    st.session_state["raw_posts"] = raw_posts
+    return all_posts, thread_summaries
 
-if "metrics" in st.session_state:
-    metrics = st.session_state["metrics"]
-    raw_posts = st.session_state["raw_posts"]
+
+# -----------------------------------------------------------------------------
+# STREAMLIT UI & SIDEBAR
+# -----------------------------------------------------------------------------
+def main():
+    st.title("🔥 IGN Boards Reaction Analytics")
+    st.markdown("Analyze top reaction givers, top getters, and overall thread engagement.")
+
+    # --- Sidebar Parameters ---
+    st.sidebar.header("Scraper Settings")
+    
+    board_url = st.sidebar.text_input(
+        "IGN Board URL",
+        value="https://www.ignboards.com/forums/the-vestibule.5296/"
+    )
+    
+    days_back = st.sidebar.slider("Lookback Window (Days)", min_value=1, max_value=14, value=7)
+    
+    enable_test_mode = st.sidebar.checkbox("Enable 10-Thread Test Limit", value=True)
+    max_limit = 10 if enable_test_mode else None
+
+    # --- Cache Control ---
+    st.sidebar.markdown("---")
+    st.sidebar.header("Data Control")
+    if st.sidebar.button("🔄 Force Refresh Data"):
+        fetch_board_data.clear()
+        st.rerun()
+
+    # --- Load Data ---
+    with st.spinner("Fetching board data (or loading from cache)..."):
+        all_posts, thread_summaries = fetch_board_data(board_url, days_back, max_threads_limit=max_limit)
+
+    if not all_posts:
+        st.warning("No posts or reactions found for the selected timeframe/board.")
+        return
+
+    # --- Aggregation ---
+    aggregator = MetricsAggregator(all_posts, thread_summaries)
+    top_givers = aggregator.get_top_reaction_givers()
+    top_getters = aggregator.get_top_reaction_getters()
+    most_reacted_posts = aggregator.get_most_reacted_posts()
+
+    # -----------------------------------------------------------------------------
+    # DASHBOARD DISPLAY
+    # -----------------------------------------------------------------------------
+    
+    # 1. High-Level Metrics
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Threads Analyzed", len(thread_summaries))
+    col2.metric("Total Posts Analyzed", len(all_posts))
+    col3.metric("Total Reactions", sum(t.total_reactions for t in thread_summaries))
+    avg_rxn = round(sum(t.total_reactions for t in thread_summaries) / max(len(thread_summaries), 1), 2)
+    col4.metric("Avg Reactions / Thread", avg_rxn)
 
     st.markdown("---")
 
-    kpi1, kpi2, kpi3 = st.columns(3, gap=20)
-    kpi1.metric("Threads Analyzed", metrics.threads_scraped)
-    kpi2.metric("Total Reactions", metrics.total_reactions)
-    kpi3.metric("Avg Reactions / Thread", round(metrics.total_reactions / metrics.threads_scraped, 1) if metrics.threads_scraped else 0)
+    # 2. Leaderboards
+    left_col, right_col = st.columns(2)
+
+    with left_col:
+        st.subheader("🏆 Top Reaction Getters (Most Reacted Users)")
+        if top_getters:
+            df_getters = pd.DataFrame(top_getters, columns=["Username", "Reactions Received"])
+            st.dataframe(df_getters, use_container_width=True, hide_index=True)
+        else:
+            st.info("No reaction getter data available.")
+
+    with right_col:
+        st.subheader("🎁 Top Reaction Givers (Most Active Reactors)")
+        if top_givers:
+            df_givers = pd.DataFrame(top_givers, columns=["Username", "Reactions Given"])
+            st.dataframe(df_givers, use_container_width=True, hide_index=True)
+        else:
+            st.info("No reaction giver data available.")
 
     st.markdown("---")
 
-    c1, c2 = st.columns(2, gap=24)
-    c1.info(f"🏆 **Top Reaction Giver:** {metrics.top_reactor[0]} (`{metrics.top_reactor[1]}` given)")
-    c2.success(f"👑 **Top Reaction Receiver:** {metrics.top_getter[0]} (`{metrics.top_getter[1]}` received)")
+    # 3. Top Content
+    st.subheader("⭐ Most Reacted Posts")
+    if most_reacted_posts:
+        for idx, post in enumerate(most_reacted_posts[:5], 1):
+            with st.expander(f"#{idx} — {post.author} ({post.reaction_count} reactions) in '{post.thread_title}'"):
+                st.write(post.content_snippet)
+                if post.reactors:
+                    st.caption(f"**Reactors:** {', '.join(post.reactors)}")
+                st.markdown(f"[View Original Post]({post.post_url})")
 
-    st.markdown("---")
 
-    tab_summary, tab_data = st.tabs(["📌 Highlights", "📋 Raw Post Data"])
-
-    with tab_summary:
-        sum_col1, sum_col2 = st.columns(2, gap=20)
-        with sum_col1:
-            st.subheader("🔥 Top Thread")
-            if metrics.most_reacted_thread:
-                st.write(f"**Title:** [{metrics.most_reacted_thread.title}]({metrics.most_reacted_thread.url})")
-                st.write(f"**Total Reactions:** {metrics.most_reacted_thread.total_reactions}")
-
-        with sum_col2:
-            st.subheader("💬 Top Single Post")
-            if metrics.most_reacted_post:
-                st.write(f"**Author:** {metrics.most_reacted_post.author}")
-                st.write(f"**Reactions:** {metrics.most_reacted_post.reaction_count}")
-                st.write(f"[Direct Link]({metrics.most_reacted_post.url})")
-
-    with tab_data:
-        st.subheader("Post Metric Explorer")
-        if raw_posts:
-            df = pd.DataFrame([
-                {
-                    "Author": p.author,
-                    "Reactions": p.reaction_count,
-                    "Thread": p.thread_title,
-                    "Post Link": p.url,
-                }
-                for p in raw_posts
-            ])
-            st.dataframe(
-                df,
-                use_container_width=True,
-                column_config={
-                    "Post Link": st.column_config.LinkColumn("Post Link", display_text="Open Post"),
-                    "Reactions": st.column_config.NumberColumn("Reactions", format="%d ⭐"),
-                },
-                hide_index=True,
-            )
+if __name__ == "__main__":
+    main()
