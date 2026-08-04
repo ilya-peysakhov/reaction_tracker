@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 @dataclass
@@ -18,4 +18,13 @@ class PostMetric:
 class ThreadMetric:
     title: str
     url: str
+    total_reactions: int = 0
+
+
+@dataclass
+class AggregatedMetrics:
+    top_givers: List[Tuple[str, int]] = field(default_factory=list)
+    top_getters: List[Tuple[str, int]] = field(default_factory=list)
+    most_reacted_posts: List[PostMetric] = field(default_factory=list)
+    total_posts: int = 0
     total_reactions: int = 0
