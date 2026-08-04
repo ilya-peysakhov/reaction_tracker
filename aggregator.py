@@ -34,7 +34,7 @@ class MetricsAggregator:
         """
         return sorted(self.posts, key=lambda p: p.reaction_count, reverse=True)[:limit]
 
-    def get_summary_metrics(() -> AggregatedMetrics:
+    def get_summary_metrics() -> AggregatedMetrics:
         """
         Returns a dataclass containing all compiled dashboard metrics.
         """
