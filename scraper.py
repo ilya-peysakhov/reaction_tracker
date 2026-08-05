@@ -92,9 +92,10 @@ class IGNScraper:
 
         return None
 
-    def get_board_threads(self, board_url: str) -> List[BeautifulSoup]:
-        """Fetches the main board index page and returns thread item tags."""
-        soup = self._get_soup(board_url)
+    def get_board_threads(self, board_url: str, page: int = 1) -> List[BeautifulSoup]:
+        """Fetches a single board index page and returns thread item tags."""
+        url = f"{board_url}page-{page}" if page > 1 else board_url
+        soup = self._get_soup(url)
         if not soup:
             return []
         return soup.select(".structItem--thread")
