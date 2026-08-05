@@ -19,7 +19,7 @@ st.markdown(
 st.sidebar.header("Scraper Configuration")
 board_url = st.sidebar.text_input(
     "IGN Board URL",
-    value="https://www.ignboards.com/forums/vestibule.80000/",
+    value="https://www.ignboards.com/forums/the-vestibule.5296/",
     help="URL of the main board or forum sub-section.",
 )
 
