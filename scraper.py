@@ -100,41 +100,30 @@ class IGNScraper:
         return soup.select(".structItem--thread")
 
     def extract_post_reactions(self, post_soup: BeautifulSoup) -> Tuple[int, List[str]]:
-        """
-        Parses total reaction counts and named reactors from XenForo's DOM structure.
-        Correctly accounts for XenForo's 'and X others' truncation text.
-        """
         reaction_count = 0
         reactors = []
-
-        # Find the active reaction bar container
+    
         reaction_bar = post_soup.select_one(".reactionsBar.is-active, .js-reactionsList.is-active")
         if not reaction_bar:
             return 0, []
-
-        # 1. Extract named member profile links inside the reaction bar
-        member_links = reaction_bar.select("a[href*='/members/'], a.reactionsBar-link")
-        for link in member_links:
-            username = link.get_text(strip=True)
-            # Filter out navigation text like 'and 3 others' if matched by reactionsBar-link
-            if username and not re.search(r"\b\d+\s+other", username, re.IGNORECASE):
-                if username not in reactors:
-                    reactors.append(username)
-
-        # 2. Get full text of the reaction bar (e.g., "In_The_Fade, tarhaun and 5 others")
+    
+        # Named reactors are <bdi> tags, possibly nested inside member links
+        # or a single combined reactionsBar-link anchor. Pull bdi text directly
+        # rather than the anchor's flattened text.
+        for bdi in reaction_bar.select("a[href*='/members/'] bdi, a.reactionsBar-link bdi"):
+            username = bdi.get_text(strip=True)
+            if username and username not in reactors:
+                reactors.append(username)
+    
         bar_text = reaction_bar.get_text(" ", strip=True)
-
-        # 3. Check for XenForo's "and X other(s)" pattern
         others_match = re.search(r"and\s+(\d+)\s+other", bar_text, re.IGNORECASE)
-
+    
         if others_match:
-            # Total = named visible reactors + numerical 'others' count
             additional_count = int(others_match.group(1))
             reaction_count = len(reactors) + additional_count
         else:
-            # Fallback to count of named reactor usernames or 1 if bar is active
             reaction_count = len(reactors) if reactors else 1
-
+    
         return reaction_count, reactors
 
     def parse_posts_from_page(
