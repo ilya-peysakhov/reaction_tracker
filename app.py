@@ -25,57 +25,71 @@ def fetch_board_data(board_url: str, days_back: int, max_threads_limit: int = 10
     """
     scraper = IGNScraper()
     cutoff_date = datetime.now() - timedelta(days=days_back)
-    
+
     all_posts = []
     thread_summaries = []
-    
-    # 1. Fetch board index
-    threads = scraper.get_board_threads(board_url)
-    
-    for thread in threads:
-        # Check thread timestamp for cutoff
-        latest_time_tag = thread.select_one(".structItem-cell--latest time.u-dt")
-        latest_date = scraper.parse_time(latest_time_tag)
 
-        if latest_date and latest_date < cutoff_date:
-            break
+    # 1. Walk board index pages until we pass the cutoff or run out of pages
+    board_page = 1
+    hit_board_cutoff = False
+    hit_thread_limit = False
 
-        title_tag = thread.select_one(
-            ".structItem-title a[data-tp-primary='on'], .structItem-title a[href*='/threads/']"
-        )
-        if not title_tag:
-            continue
+    while not hit_board_cutoff and not hit_thread_limit:
+        threads = scraper.get_board_threads(board_url, page=board_page)
+        if not threads:
+            break  # no more board pages
 
-        title = title_tag.get_text(strip=True)
-        href = title_tag["href"]
-        full_url = scraper.BASE_URL + href if href.startswith("/") else href
+        for thread in threads:
+            if "structItem--sticky" in thread.get("class", []):
+                continue  # stickies aren't in date order, skip for cutoff purposes
 
-        # Check for page jump indicators
-        last_page = 1
-        page_jump_links = thread.select(".structItem-pageJump a")
-        if page_jump_links:
-            last_link_text = page_jump_links[-1].get_text(strip=True)
-            if last_link_text.isdigit():
-                last_page = int(last_link_text)
+            # Check thread timestamp for cutoff
+            latest_time_tag = thread.select_one(".structItem-cell--latest time.u-dt")
+            latest_date = scraper.parse_time(latest_time_tag)
 
-        # Scrape thread posts backwards from the last page
-        posts = scraper.scrape_thread_backwards(
-            full_url, cutoff_date, initial_max_page=last_page
-        )
+            if latest_date and latest_date < cutoff_date:
+                hit_board_cutoff = True
+                break
 
-        thread_reactions = 0
-        for post in posts:
-            post.thread_title = title
-            thread_reactions += post.reaction_count
-            all_posts.append(post)
+            title_tag = thread.select_one(
+                ".structItem-title a[data-tp-primary='on'], .structItem-title a[href*='/threads/']"
+            )
+            if not title_tag:
+                continue
 
-        thread_summaries.append(
-            ThreadMetric(title=title, url=full_url, total_reactions=thread_reactions)
-        )
+            title = title_tag.get_text(strip=True)
+            href = title_tag["href"]
+            full_url = scraper.BASE_URL + href if href.startswith("/") else href
 
-        # --- TEST LIMIT CAP ---
-        if max_threads_limit and len(thread_summaries) >= max_threads_limit:
-            break
+            # Check for page jump indicators
+            last_page = 1
+            page_jump_links = thread.select(".structItem-pageJump a")
+            if page_jump_links:
+                last_link_text = page_jump_links[-1].get_text(strip=True)
+                if last_link_text.isdigit():
+                    last_page = int(last_link_text)
+
+            # Scrape thread posts backwards from the last page
+            posts = scraper.scrape_thread_backwards(
+                full_url, cutoff_date, initial_max_page=last_page
+            )
+
+            thread_reactions = 0
+            for post in posts:
+                post.thread_title = title
+                thread_reactions += post.reaction_count
+                all_posts.append(post)
+
+            thread_summaries.append(
+                ThreadMetric(title=title, url=full_url, total_reactions=thread_reactions)
+            )
+
+            # --- TEST LIMIT CAP ---
+            if max_threads_limit and len(thread_summaries) >= max_threads_limit:
+                hit_thread_limit = True
+                break
+
+        board_page += 1
 
     return all_posts, thread_summaries
 
@@ -89,14 +103,14 @@ def main():
 
     # --- Sidebar Parameters ---
     st.sidebar.header("Scraper Settings")
-    
+
     board_url = st.sidebar.text_input(
         "IGN Board URL",
         value="https://www.ignboards.com/forums/the-vestibule.5296/"
     )
-    
+
     days_back = st.sidebar.slider("Lookback Window (Days)", min_value=1, max_value=14, value=7)
-    
+
     enable_test_mode = st.sidebar.checkbox("Enable 10-Thread Test Limit", value=True)
     max_limit = 10 if enable_test_mode else None
 
@@ -124,7 +138,7 @@ def main():
     # -----------------------------------------------------------------------------
     # DASHBOARD DISPLAY
     # -----------------------------------------------------------------------------
-    
+
     # 1. High-Level Metrics
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Threads Analyzed", len(thread_summaries))
