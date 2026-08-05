@@ -1,176 +1,120 @@
-from datetime import datetime
-import random
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 import re
-import time
 from typing import List, Optional, Tuple
 from bs4 import BeautifulSoup
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-from models import PostMetric
+
+@dataclass
+class PostMetric:
+    author: str
+    reactions: int
+    post_date: datetime
 
 
 class IGNScraper:
     BASE_URL = "https://www.ignboards.com"
 
-    # Pool of desktop & mobile User-Agents across Chrome, Firefox, Safari, and Edge
-    USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1",
-        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
-    ]
-
-    def __init__(self, max_retries: int = 3):
+    def __init__(self, headers: Optional[dict] = None):
+        self.headers = headers or {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/115.0.0.0 Safari/537.36"
+            )
+        }
         self.session = requests.Session()
-        
-        # Configure automatic retry behavior with exponential backoff
-        retries = Retry(
-            total=max_retries,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            raise_on_status=False
-        )
-        adapter = HTTPAdapter(max_retries=retries)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-
-    def _rotate_headers(self) -> None:
-        """Applies a random User-Agent and default headers to the request session."""
-        self.session.headers.update({
-            "User-Agent": random.choice(self.USER_AGENTS),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Referer": self.BASE_URL,
-        })
+        self.session.headers.update(self.headers)
 
     def _get_soup(self, url: str) -> Optional[BeautifulSoup]:
-        """Performs a GET request with jittered delay and header rotation."""
-        self._rotate_headers()
-        
-        # Add slight jitter to avoid request cadence detection (0.5s to 1.5s)
-        time.sleep(random.uniform(0.5, 1.5))
-        
+        """Fetches a page and returns a BeautifulSoup object."""
         try:
-            res = self.session.get(url, timeout=10)
-            if res.status_code == 200:
-                return BeautifulSoup(res.text, "html.parser")
-            elif res.status_code == 429:
-                # Extra cooldown on rate limit
-                time.sleep(5)
+            response = self.session.get(url, timeout=10)
+            if response.status_code == 200:
+                return BeautifulSoup(response.text, "html.parser")
+            return None
         except requests.RequestException:
-            pass
-        return None
+            return None
 
     def parse_time(self, time_tag) -> Optional[datetime]:
-        """Extracts datetime objects from XenForo <time> tags."""
+        """Parses XenForo <time> tags into a timezone-naive datetime object."""
         if not time_tag:
             return None
 
-        # XenForo provides epoch timestamp in data-time or standard ISO string in datetime attribute
-        if time_tag.has_attr("data-time"):
+        # XenForo timestamps usually store UNIX timestamp in data-time
+        data_time = time_tag.get("data-time")
+        if data_time:
             try:
-                return datetime.fromtimestamp(int(time_tag["data-time"]))
-            except ValueError:
+                return datetime.fromtimestamp(int(data_time))
+            except (ValueError, TypeError):
                 pass
 
-        if time_tag.has_attr("datetime"):
+        # Fallback to datetime attribute string
+        datetime_attr = time_tag.get("datetime")
+        if datetime_attr:
             try:
-                # Handle ISO 8601 formatting variants
-                dt_str = time_tag["datetime"].replace("Z", "+00:00")
-                return datetime.fromisoformat(dt_str).replace(tzinfo=None)
+                # Remove timezone offset for naive comparison
+                clean_attr = re.sub(r"([+-]\d{2}:\d{2}|Z)$", "", datetime_attr)
+                return datetime.fromisoformat(clean_attr)
             except ValueError:
                 pass
 
         return None
 
-    def get_board_threads(self, board_url: str, page: int = 1) -> List[BeautifulSoup]:
-        """Fetches a single board index page and returns thread item tags."""
-        url = f"{board_url}page-{page}" if page > 1 else board_url
-        soup = self._get_soup(url)
-        if not soup:
-            return []
-        return soup.select(".structItem--thread")
+    def get_max_page(self, soup: BeautifulSoup) -> int:
+        """Finds the maximum page number from pagination controls."""
+        page_nav = soup.find("ul", class_="pageNav-list")
+        if not page_nav:
+            return 1
 
-    def extract_post_reactions(self, post_soup: BeautifulSoup) -> Tuple[int, List[str]]:
-        reaction_count = 0
-        reactors = []
-    
-        reaction_bar = post_soup.select_one(".reactionsBar.is-active, .js-reactionsList.is-active")
-        if not reaction_bar:
-            return 0, []
-    
-        # Named reactors are <bdi> tags, possibly nested inside member links
-        # or a single combined reactionsBar-link anchor. Pull bdi text directly
-        # rather than the anchor's flattened text.
-        for bdi in reaction_bar.select("a[href*='/members/'] bdi, a.reactionsBar-link bdi"):
-            username = bdi.get_text(strip=True)
-            if username and username not in reactors:
-                reactors.append(username)
-    
-        bar_text = reaction_bar.get_text(" ", strip=True)
-        others_match = re.search(r"and\s+(\d+)\s+other", bar_text, re.IGNORECASE)
-    
-        if others_match:
-            additional_count = int(others_match.group(1))
-            reaction_count = len(reactors) + additional_count
-        else:
-            reaction_count = len(reactors) if reactors else 1
-    
-        return reaction_count, reactors
+        pages = []
+        for li in page_nav.find_all("li", class_="pageNav-page"):
+            text = li.get_text(strip=True)
+            if text.isdigit():
+                pages.append(int(text))
+
+        return max(pages) if pages else 1
 
     def parse_posts_from_page(
         self, soup: BeautifulSoup, cutoff_date: datetime
     ) -> Tuple[List[PostMetric], bool]:
-        """
-        Parses post items on a single page.
-        Returns a tuple of (parsed_posts, hit_cutoff_flag).
-        """
+        """Parses individual posts from a thread page until the cutoff date is met."""
         posts = []
         hit_cutoff = False
 
-        post_elements = soup.select("article.message--post, .js-post")
+        articles = soup.find_all("article", class_="message--post")
+        for article in articles:
+            time_tag = article.find("time", class_="u-dt")
+            post_date = self.parse_time(time_tag)
 
-        for post_elem in post_elements:
-            time_tag = post_elem.select_one("time.u-dt")
-            post_time = self.parse_time(time_tag)
-
-            if post_time and post_time < cutoff_date:
-                hit_cutoff = True
+            if not post_date:
                 continue
 
-            author = post_elem.get("data-author", "Unknown")
-            
-            # Post URL permalink extraction
-            permalink_tag = post_elem.select_one("a[href*='/posts/']")
-            post_url = ""
-            if permalink_tag and permalink_tag.has_attr("href"):
-                href = permalink_tag["href"]
-                post_url = self.BASE_URL + href if href.startswith("/") else href
+            # Check if post is older than cutoff
+            if post_date < cutoff_date:
+                hit_cutoff = True
+                break
 
-            # Content snippet snippet creation
-            content_elem = post_elem.select_one(".message-body, .js-selectToQuote")
-            content_snippet = content_elem.get_text(" ", strip=True)[:300] if content_elem else ""
+            # Parse Author
+            author = article.get("data-author", "Unknown")
 
-            # Extract reactions and reactors list
-            reaction_count, reactors = self.extract_post_reactions(post_elem)
+            # Parse Reactions / Likes
+            reactions = 0
+            reactions_link = article.find("a", class_="reactionsBar-link")
+            if reactions_link:
+                # E.g., "User1, User2, User3 and 5 others"
+                text = reactions_link.get_text(strip=True)
+                numbers = re.findall(r"\d+", text)
+                if numbers:
+                    reactions = sum(int(n) for n in numbers)
+                else:
+                    # If named users are present without extra counts
+                    reactions = len(text.split(","))
 
             posts.append(
                 PostMetric(
-                    author=author,
-                    created_at=post_time or datetime.now(),
-                    reaction_count=reaction_count,
-                    reactors=reactors,
-                    post_url=post_url,
-                    content_snippet=content_snippet,
+                    author=author, reactions=reactions, post_date=post_date
                 )
             )
 
@@ -179,14 +123,21 @@ class IGNScraper:
     def scrape_thread_backwards(
         self, thread_url: str, cutoff_date: datetime, initial_max_page: int = 1
     ) -> List[PostMetric]:
-        """
-        Crawls a thread from the latest page backwards until reaching the cutoff date.
-        """
+        """Scrapes thread pages in reverse from last page down to cutoff date."""
         all_thread_posts = []
         current_page = initial_max_page
 
+        # Clean base thread URL: remove /unread and ensure trailing slash
+        clean_url = re.sub(r"/unread/?$", "/", thread_url)
+        if not clean_url.endswith("/"):
+            clean_url += "/"
+
         while current_page >= 1:
-            page_url = f"{thread_url}page-{current_page}" if current_page > 1 else thread_url
+            page_url = (
+                f"{clean_url}page-{current_page}"
+                if current_page > 1
+                else clean_url
+            )
             soup = self._get_soup(page_url)
 
             if not soup:
