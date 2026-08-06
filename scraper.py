@@ -102,9 +102,8 @@ class IGNScraper:
     def extract_post_reactions(self, post_soup: BeautifulSoup) -> Tuple[int, List[str]]:
         """
         Parses total reaction counts and named reactors from XenForo's DOM structure.
-        Correctly accounts for XenForo's 'and X others' truncation text.
+        Handles standard member profile links, 'You' text, and 'and X others' truncation text.
         """
-        reaction_count = 0
         reactors = []
 
         # Find the active reaction bar container
@@ -116,24 +115,28 @@ class IGNScraper:
         member_links = reaction_bar.select("a[href*='/members/'], a.reactionsBar-link")
         for link in member_links:
             username = link.get_text(strip=True)
-            # Filter out navigation text like 'and 3 others' if matched by reactionsBar-link
+            # Filter out navigation text like 'and 3 others'
             if username and not re.search(r"\b\d+\s+other", username, re.IGNORECASE):
-                if username not in reactors:
+                if username.lower() != "you" and username not in reactors:
                     reactors.append(username)
 
-        # 2. Get full text of the reaction bar (e.g., "In_The_Fade, tarhaun and 5 others")
+        # 2. Get full text of the reaction bar
         bar_text = reaction_bar.get_text(" ", strip=True)
 
-        # 3. Check for XenForo's "and X other(s)" pattern
+        # 3. Account for the logged-in user ("You") if present in the text
+        has_you = bool(re.search(r"\bYou\b", bar_text))
+        if has_you and "You" not in reactors:
+            reactors.insert(0, "You")
+
+        # 4. Check for XenForo's "and X other(s)" truncation pattern
         others_match = re.search(r"and\s+(\d+)\s+other", bar_text, re.IGNORECASE)
 
         if others_match:
-            # Total = named visible reactors + numerical 'others' count
             additional_count = int(others_match.group(1))
             reaction_count = len(reactors) + additional_count
         else:
-            # Fallback to count of named reactor usernames or 1 if bar is active
-            reaction_count = len(reactors) if reactors else 1
+            # If there's no "others" text, the reaction count is simply the total named reactors found
+            reaction_count = len(reactors)
 
         return reaction_count, reactors
 
