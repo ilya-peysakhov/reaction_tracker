@@ -181,7 +181,7 @@ def main():
         st.subheader("🏆 Top Reaction Getters (Most Reacted Users)")
         if top_getters:
             df_getters = pd.DataFrame(top_getters, columns=["Username", "Reactions Received"])
-            st.dataframe(df_getters, use_container_width=True, hide_index=True)
+            st.dataframe(df_getters, width='content', hide_index=True)
         else:
             st.info("No reaction getter data available.")
 
@@ -189,7 +189,7 @@ def main():
         st.subheader("🎁 Top Reaction Givers (Most Active Reactors)")
         if top_givers:
             df_givers = pd.DataFrame(top_givers, columns=["Username", "Reactions Given"])
-            st.dataframe(df_givers, use_container_width=True, hide_index=True)
+            st.dataframe(df_givers, width='content', hide_index=True)
         else:
             st.info("No reaction giver data available.")
 
