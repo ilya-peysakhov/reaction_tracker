@@ -102,43 +102,46 @@ class IGNScraper:
     def extract_post_reactions(self, post_soup: BeautifulSoup) -> Tuple[int, List[str]]:
         """
         Parses total reaction counts and named reactors from XenForo's DOM structure.
-        Handles standard member profile links, 'You' text, and 'and X others' truncation text.
+        Correctly parses listed usernames and accounts for 'and X others' truncation text.
         """
-        reactors = []
-
         # Find the active reaction bar container
-        reaction_bar = post_soup.select_one(".reactionsBar.is-active, .js-reactionsList.is-active")
+        reaction_bar = post_soup.select_one(".reactionsBar.is-active, .js-reactionsList.is-active, .reactionsBar")
         if not reaction_bar:
             return 0, []
 
-        # 1. Extract named member profile links inside the reaction bar
+        reactors = []
+
+        # 1. Primary approach: Extract named member profile links inside the reaction bar
         member_links = reaction_bar.select("a[href*='/members/'], a.reactionsBar-link")
         for link in member_links:
             username = link.get_text(strip=True)
-            # Filter out navigation text like 'and 3 others'
+            # Exclude truncation clauses matched by class names
             if username and not re.search(r"\b\d+\s+other", username, re.IGNORECASE):
-                if username.lower() != "you" and username not in reactors:
+                if username not in reactors:
                     reactors.append(username)
 
-        # 2. Get full text of the reaction bar
         bar_text = reaction_bar.get_text(" ", strip=True)
 
-        # 3. Account for the logged-in user ("You") if present in the text
-        has_you = bool(re.search(r"\bYou\b", bar_text))
-        if has_you and "You" not in reactors:
-            reactors.insert(0, "You")
+        # 2. Fallback text parsing if no member links were grabbed directly
+        if not reactors:
+            # Clean off trailing "... and X others"
+            clean_text = re.sub(r'and\s+\d+\s+others?.*$', '', bar_text, flags=re.IGNORECASE).strip()
+            # Convert word boundaries around "and" into commas
+            clean_text = re.sub(r'\band\b', ',', clean_text, flags=re.IGNORECASE)
+            # Split and extract unique non-empty username strings
+            for name in clean_text.split(','):
+                name = name.strip()
+                if name and name not in reactors:
+                    reactors.append(name)
 
-        # 4. Check for XenForo's "and X other(s)" truncation pattern
+        # 3. Check for XenForo's "and X other(s)" trailing pattern
         others_match = re.search(r"and\s+(\d+)\s+other", bar_text, re.IGNORECASE)
+        others_count = int(others_match.group(1)) if others_match else 0
 
-        if others_match:
-            additional_count = int(others_match.group(1))
-            reaction_count = len(reactors) + additional_count
-        else:
-            # If there's no "others" text, the reaction count is simply the total named reactors found
-            reaction_count = len(reactors)
+        # Total count = named visible reactors + hidden additional users count
+        total_reaction_count = len(reactors) + others_count
 
-        return reaction_count, reactors
+        return total_reaction_count, reactors
 
     def parse_posts_from_page(
         self, soup: BeautifulSoup, cutoff_date: datetime
@@ -169,7 +172,7 @@ class IGNScraper:
                 href = permalink_tag["href"]
                 post_url = self.BASE_URL + href if href.startswith("/") else href
 
-            # Content snippet snippet creation
+            # Content snippet creation
             content_elem = post_elem.select_one(".message-body, .js-selectToQuote")
             content_snippet = content_elem.get_text(" ", strip=True)[:300] if content_elem else ""
 
