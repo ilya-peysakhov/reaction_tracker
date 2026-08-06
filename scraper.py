@@ -14,7 +14,6 @@ from models import PostMetric
 class IGNScraper:
     BASE_URL = "https://www.ignboards.com"
 
-    # Pool of desktop & mobile User-Agents across Chrome, Firefox, Safari, and Edge
     USER_AGENTS = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
@@ -31,8 +30,6 @@ class IGNScraper:
 
     def __init__(self, max_retries: int = 3):
         self.session = requests.Session()
-        
-        # Configure automatic retry behavior with exponential backoff
         retries = Retry(
             total=max_retries,
             backoff_factor=1,
@@ -44,7 +41,6 @@ class IGNScraper:
         self.session.mount("https://", adapter)
 
     def _rotate_headers(self) -> None:
-        """Applies a random User-Agent and default headers to the request session."""
         self.session.headers.update({
             "User-Agent": random.choice(self.USER_AGENTS),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -53,29 +49,22 @@ class IGNScraper:
         })
 
     def _get_soup(self, url: str) -> Optional[BeautifulSoup]:
-        """Performs a GET request with jittered delay and header rotation."""
         self._rotate_headers()
-        
-        # Add slight jitter to avoid request cadence detection (0.5s to 1.5s)
         time.sleep(random.uniform(0.5, 1.5))
-        
         try:
             res = self.session.get(url, timeout=10)
             if res.status_code == 200:
                 return BeautifulSoup(res.text, "html.parser")
             elif res.status_code == 429:
-                # Extra cooldown on rate limit
                 time.sleep(5)
         except requests.RequestException:
             pass
         return None
 
     def parse_time(self, time_tag) -> Optional[datetime]:
-        """Extracts datetime objects from XenForo <time> tags."""
         if not time_tag:
             return None
 
-        # XenForo provides epoch timestamp in data-time or standard ISO string in datetime attribute
         if time_tag.has_attr("data-time"):
             try:
                 return datetime.fromtimestamp(int(time_tag["data-time"]))
@@ -84,7 +73,6 @@ class IGNScraper:
 
         if time_tag.has_attr("datetime"):
             try:
-                # Handle ISO 8601 formatting variants
                 dt_str = time_tag["datetime"].replace("Z", "+00:00")
                 return datetime.fromisoformat(dt_str).replace(tzinfo=None)
             except ValueError:
@@ -92,64 +80,50 @@ class IGNScraper:
 
         return None
 
-    def get_board_threads(self, board_url: str) -> List[BeautifulSoup]:
-        """Fetches the main board index page and returns thread item tags."""
-        soup = self._get_soup(board_url)
+    def get_board_threads(self, board_url: str, page: int = 1) -> List[BeautifulSoup]:
+        """Fetches a specific page of the board index and returns thread item tags."""
+        url = board_url.rstrip("/")
+        if page > 1:
+            url = f"{url}/page-{page}"
+            
+        soup = self._get_soup(url)
         if not soup:
             return []
         return soup.select(".structItem--thread")
 
     def extract_post_reactions(self, post_soup: BeautifulSoup) -> Tuple[int, List[str]]:
-        """
-        Parses total reaction counts and named reactors from XenForo's DOM structure.
-        Correctly parses listed usernames and accounts for 'and X others' truncation text.
-        """
-        # Find the active reaction bar container
         reaction_bar = post_soup.select_one(".reactionsBar.is-active, .js-reactionsList.is-active, .reactionsBar")
         if not reaction_bar:
             return 0, []
 
         reactors = []
 
-        # 1. Primary approach: Extract named member profile links inside the reaction bar
         member_links = reaction_bar.select("a[href*='/members/'], a.reactionsBar-link")
         for link in member_links:
             username = link.get_text(strip=True)
-            # Exclude truncation clauses matched by class names
             if username and not re.search(r"\b\d+\s+other", username, re.IGNORECASE):
                 if username not in reactors:
                     reactors.append(username)
 
         bar_text = reaction_bar.get_text(" ", strip=True)
 
-        # 2. Fallback text parsing if no member links were grabbed directly
         if not reactors:
-            # Clean off trailing "... and X others"
             clean_text = re.sub(r'and\s+\d+\s+others?.*$', '', bar_text, flags=re.IGNORECASE).strip()
-            # Convert word boundaries around "and" into commas
             clean_text = re.sub(r'\band\b', ',', clean_text, flags=re.IGNORECASE)
-            # Split and extract unique non-empty username strings
             for name in clean_text.split(','):
                 name = name.strip()
                 if name and name not in reactors:
                     reactors.append(name)
 
-        # 3. Check for XenForo's "and X other(s)" trailing pattern
         others_match = re.search(r"and\s+(\d+)\s+other", bar_text, re.IGNORECASE)
         others_count = int(others_match.group(1)) if others_match else 0
 
-        # Total count = named visible reactors + hidden additional users count
         total_reaction_count = len(reactors) + others_count
-
         return total_reaction_count, reactors
 
     def parse_posts_from_page(
         self, soup: BeautifulSoup, cutoff_date: datetime
     ) -> Tuple[List[PostMetric], bool]:
-        """
-        Parses post items on a single page.
-        Returns a tuple of (parsed_posts, hit_cutoff_flag).
-        """
         posts = []
         hit_cutoff = False
 
@@ -165,18 +139,15 @@ class IGNScraper:
 
             author = post_elem.get("data-author", "Unknown")
             
-            # Post URL permalink extraction
             permalink_tag = post_elem.select_one("a[href*='/posts/']")
             post_url = ""
             if permalink_tag and permalink_tag.has_attr("href"):
                 href = permalink_tag["href"]
                 post_url = self.BASE_URL + href if href.startswith("/") else href
 
-            # Content snippet creation
             content_elem = post_elem.select_one(".message-body, .js-selectToQuote")
             content_snippet = content_elem.get_text(" ", strip=True)[:300] if content_elem else ""
 
-            # Extract reactions and reactors list
             reaction_count, reactors = self.extract_post_reactions(post_elem)
 
             posts.append(
@@ -195,9 +166,6 @@ class IGNScraper:
     def scrape_thread_backwards(
         self, thread_url: str, cutoff_date: datetime, initial_max_page: int = 1
     ) -> List[PostMetric]:
-        """
-        Crawls a thread from the latest page backwards until reaching the cutoff date.
-        """
         all_thread_posts = []
         current_page = initial_max_page
 
