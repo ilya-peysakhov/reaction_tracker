@@ -14,14 +14,14 @@ st.set_page_config(
     layout="wide"
 )
 
+
 # -----------------------------------------------------------------------------
-# CACHED DATA PIPELINE
+# SCRAPE ENGINE WITH PROGRESS CALLBACK
 # -----------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_board_data(board_url: str, days_back: int, max_threads_limit: int = 10):
+def run_board_scraper(board_url: str, days_back: int, max_threads_limit: int = 10, progress_callback=None):
     """
     Scrapes threads and posts from an IGN Board category.
-    Cached for 1 hour (3600s) to prevent redundant HTTP requests.
+    Accepts an optional callback function to update progress in the UI.
     """
     scraper = IGNScraper()
     cutoff_date = datetime.now() - timedelta(days=days_back)
@@ -32,7 +32,16 @@ def fetch_board_data(board_url: str, days_back: int, max_threads_limit: int = 10
     # 1. Fetch board index
     threads = scraper.get_board_threads(board_url)
     
-    for thread in threads:
+    if max_threads_limit:
+        threads = threads[:max_threads_limit]
+        
+    total_threads_to_process = len(threads)
+    
+    for idx, thread in enumerate(threads, 1):
+        # Update progress bar via callback
+        if progress_callback:
+            progress_callback(idx, total_threads_to_process)
+
         # Check thread timestamp for cutoff
         latest_time_tag = thread.select_one(".structItem-cell--latest time.u-dt")
         latest_date = scraper.parse_time(latest_time_tag)
@@ -73,10 +82,6 @@ def fetch_board_data(board_url: str, days_back: int, max_threads_limit: int = 10
             ThreadMetric(title=title, url=full_url, total_reactions=thread_reactions)
         )
 
-        # --- TEST LIMIT CAP ---
-        if max_threads_limit and len(thread_summaries) >= max_threads_limit:
-            break
-
     return all_posts, thread_summaries
 
 
@@ -86,6 +91,10 @@ def fetch_board_data(board_url: str, days_back: int, max_threads_limit: int = 10
 def main():
     st.title("🔥 IGN Boards Reaction Analytics")
     st.markdown("Analyze top reaction givers, top getters, and overall thread engagement.")
+
+    # Initialize Session State variables for persistent data storage across re-renders
+    if "scrape_data" not in st.session_state:
+        st.session_state.scrape_data = None
 
     # --- Sidebar Parameters ---
     st.sidebar.header("Scraper Settings")
@@ -100,16 +109,43 @@ def main():
     enable_test_mode = st.sidebar.checkbox("Enable 10-Thread Test Limit", value=True)
     max_limit = 10 if enable_test_mode else None
 
-    # --- Cache Control ---
+    # --- Action Button ---
     st.sidebar.markdown("---")
-    st.sidebar.header("Data Control")
-    if st.sidebar.button("🔄 Force Refresh Data"):
-        fetch_board_data.clear()
-        st.rerun()
+    run_scrape = st.sidebar.button("🚀 Run Scraper", type="primary")
 
-    # --- Load Data ---
-    with st.spinner("Fetching board data (or loading from cache)..."):
-        all_posts, thread_summaries = fetch_board_data(board_url, days_back, max_threads_limit=max_limit)
+    if run_scrape:
+        # Create progress containers
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        def update_progress(current: int, total: int):
+            percent = int((current / total) * 100)
+            progress_bar.progress(percent)
+            status_text.info(f"Reading thread **{current}** of **{total}**...")
+
+        # Run scraper execution
+        all_posts, thread_summaries = run_board_scraper(
+            board_url=board_url,
+            days_back=days_back,
+            max_threads_limit=max_limit,
+            progress_callback=update_progress
+        )
+
+        # Save to session state
+        st.session_state.scrape_data = (all_posts, thread_summaries)
+        
+        # Clean up progress widgets
+        progress_bar.empty()
+        status_text.empty()
+        st.success(f"Successfully scraped {len(thread_summaries)} threads!")
+
+    # Display empty state if scraper hasn't been executed yet
+    if not st.session_state.scrape_data:
+        st.info("👈 Adjust parameter settings in the sidebar and click **Run Scraper** to fetch data.")
+        return
+
+    # Extract current scraped results from Session State
+    all_posts, thread_summaries = st.session_state.scrape_data
 
     if not all_posts:
         st.warning("No posts or reactions found for the selected timeframe/board.")
