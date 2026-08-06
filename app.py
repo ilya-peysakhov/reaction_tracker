@@ -7,21 +7,19 @@ from scraper import IGNScraper
 from aggregator import MetricsAggregator
 from models import ThreadMetric, PostMetric
 
-# Page Configuration
 st.set_page_config(
     page_title="IGN Boards Analytics",
     page_icon="🔥",
     layout="wide"
 )
 
-
 # -----------------------------------------------------------------------------
-# SCRAPE ENGINE WITH PROGRESS CALLBACK
+# MULTI-PAGE BOARD SCRAPE ENGINE
 # -----------------------------------------------------------------------------
-def run_board_scraper(board_url: str, days_back: int, max_threads_limit: int = 10, progress_callback=None):
+def run_board_scraper(board_url: str, days_back: int, max_threads_limit: int = None, progress_callback=None):
     """
-    Scrapes threads and posts from an IGN Board category.
-    Accepts an optional callback function to update progress in the UI.
+    Crawls board pages sequentially (page 1, 2, 3...) fetching threads until 
+    reaching the cutoff date or max thread limit.
     """
     scraper = IGNScraper()
     cutoff_date = datetime.now() - timedelta(days=days_back)
@@ -29,58 +27,68 @@ def run_board_scraper(board_url: str, days_back: int, max_threads_limit: int = 1
     all_posts = []
     thread_summaries = []
     
-    # 1. Fetch board index
-    threads = scraper.get_board_threads(board_url)
+    board_page = 1
+    hit_board_cutoff = False
     
-    if max_threads_limit:
-        threads = threads[:max_threads_limit]
+    while not hit_board_cutoff:
+        threads = scraper.get_board_threads(board_url, page=board_page)
         
-    total_threads_to_process = len(threads)
-    
-    for idx, thread in enumerate(threads, 1):
-        # Update progress bar via callback
-        if progress_callback:
-            progress_callback(idx, total_threads_to_process)
-
-        # Check thread timestamp for cutoff
-        latest_time_tag = thread.select_one(".structItem-cell--latest time.u-dt")
-        latest_date = scraper.parse_time(latest_time_tag)
-
-        if latest_date and latest_date < cutoff_date:
+        # Stop crawling if no more threads are returned from the board
+        if not threads:
             break
 
-        title_tag = thread.select_one(
-            ".structItem-title a[data-tp-primary='on'], .structItem-title a[href*='/threads/']"
-        )
-        if not title_tag:
-            continue
+        for thread in threads:
+            # Check thread latest activity timestamp for cutoff
+            latest_time_tag = thread.select_one(".structItem-cell--latest time.u-dt")
+            latest_date = scraper.parse_time(latest_time_tag)
 
-        title = title_tag.get_text(strip=True)
-        href = title_tag["href"]
-        full_url = scraper.BASE_URL + href if href.startswith("/") else href
+            if latest_date and latest_date < cutoff_date:
+                hit_board_cutoff = True
+                break
 
-        # Check for page jump indicators
-        last_page = 1
-        page_jump_links = thread.select(".structItem-pageJump a")
-        if page_jump_links:
-            last_link_text = page_jump_links[-1].get_text(strip=True)
-            if last_link_text.isdigit():
-                last_page = int(last_link_text)
+            title_tag = thread.select_one(
+                ".structItem-title a[data-tp-primary='on'], .structItem-title a[href*='/threads/']"
+            )
+            if not title_tag:
+                continue
 
-        # Scrape thread posts backwards from the last page
-        posts = scraper.scrape_thread_backwards(
-            full_url, cutoff_date, initial_max_page=last_page
-        )
+            title = title_tag.get_text(strip=True)
+            href = title_tag["href"]
+            full_url = scraper.BASE_URL + href if href.startswith("/") else href
 
-        thread_reactions = 0
-        for post in posts:
-            post.thread_title = title
-            thread_reactions += post.reaction_count
-            all_posts.append(post)
+            # Extract max inner thread pages if available
+            last_page = 1
+            page_jump_links = thread.select(".structItem-pageJump a")
+            if page_jump_links:
+                last_link_text = page_jump_links[-1].get_text(strip=True)
+                if last_link_text.isdigit():
+                    last_page = int(last_link_text)
 
-        thread_summaries.append(
-            ThreadMetric(title=title, url=full_url, total_reactions=thread_reactions)
-        )
+            # Scrape thread posts backwards from the last page
+            posts = scraper.scrape_thread_backwards(
+                full_url, cutoff_date, initial_max_page=last_page
+            )
+
+            thread_reactions = 0
+            for post in posts:
+                post.thread_title = title
+                thread_reactions += post.reaction_count
+                all_posts.append(post)
+
+            thread_summaries.append(
+                ThreadMetric(title=title, url=full_url, total_reactions=thread_reactions)
+            )
+
+            # Update live UI progress callback
+            if progress_callback:
+                progress_callback(len(thread_summaries), board_page, title)
+
+            # Check test limit cap
+            if max_threads_limit and len(thread_summaries) >= max_threads_limit:
+                hit_board_cutoff = True
+                break
+
+        board_page += 1
 
     return all_posts, thread_summaries
 
@@ -92,7 +100,6 @@ def main():
     st.title("🔥 IGN Boards Reaction Analytics")
     st.markdown("Analyze top reaction givers, top getters, and overall thread engagement.")
 
-    # Initialize Session State variables for persistent data storage across re-renders
     if "scrape_data" not in st.session_state:
         st.session_state.scrape_data = None
 
@@ -114,16 +121,19 @@ def main():
     run_scrape = st.sidebar.button("🚀 Run Scraper", type="primary")
 
     if run_scrape:
-        # Create progress containers
-        progress_bar = st.progress(0)
         status_text = st.empty()
+        
+        # Infinite-style progress indicator (determinate progress total isn't known ahead of pagination)
+        progress_bar = st.progress(0)
 
-        def update_progress(current: int, total: int):
-            percent = int((current / total) * 100)
-            progress_bar.progress(percent)
-            status_text.info(f"Reading thread **{current}** of **{total}**...")
+        def update_progress(thread_count: int, current_board_page: int, current_title: str):
+            # Animate bar modulo so the user sees continuous movement across pages
+            progress_bar.progress((thread_count * 5) % 100)
+            status_text.info(
+                f"**Board Page {current_board_page}** | Processed **{thread_count}** threads...\n\n"
+                f" Currently reading: *{current_title[:60]}...*"
+            )
 
-        # Run scraper execution
         all_posts, thread_summaries = run_board_scraper(
             board_url=board_url,
             days_back=days_back,
@@ -131,20 +141,16 @@ def main():
             progress_callback=update_progress
         )
 
-        # Save to session state
         st.session_state.scrape_data = (all_posts, thread_summaries)
         
-        # Clean up progress widgets
         progress_bar.empty()
         status_text.empty()
-        st.success(f"Successfully scraped {len(thread_summaries)} threads!")
+        st.success(f"Scraping complete! Processed **{len(thread_summaries)}** threads across board pagination.")
 
-    # Display empty state if scraper hasn't been executed yet
     if not st.session_state.scrape_data:
         st.info("👈 Adjust parameter settings in the sidebar and click **Run Scraper** to fetch data.")
         return
 
-    # Extract current scraped results from Session State
     all_posts, thread_summaries = st.session_state.scrape_data
 
     if not all_posts:
@@ -160,8 +166,6 @@ def main():
     # -----------------------------------------------------------------------------
     # DASHBOARD DISPLAY
     # -----------------------------------------------------------------------------
-    
-    # 1. High-Level Metrics
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Threads Analyzed", len(thread_summaries))
     col2.metric("Total Posts Analyzed", len(all_posts))
@@ -171,7 +175,6 @@ def main():
 
     st.markdown("---")
 
-    # 2. Leaderboards
     left_col, right_col = st.columns(2)
 
     with left_col:
@@ -192,7 +195,6 @@ def main():
 
     st.markdown("---")
 
-    # 3. Top Content
     st.subheader("⭐ Most Reacted Posts")
     if most_reacted_posts:
         for idx, post in enumerate(most_reacted_posts[:5], 1):
