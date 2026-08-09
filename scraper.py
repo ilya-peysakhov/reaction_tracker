@@ -191,36 +191,33 @@ class IGNScraper:
         initial_max_page: Optional[int] = None
     ) -> List[Tuple[str, str, str, str]]:
         """
-        Asynchronously fetches thread pages in reverse order starting from `initial_max_page`
-        (or discovered max page) down to page 1, stopping early if reaching `cutoff_date`.
+        Asynchronously fetches thread pages in reverse order.
+        Uses initial_max_page as a fast-path, with auto-fallback to Page 1 on 404s.
         """
         thread_id = thread_url.rstrip("/").split("/")[-1]
         all_reactions = []
-
+    
         async with aiohttp.ClientSession() as session:
             first_page_html = None
             last_page = initial_max_page
-
-            # 1. If max page wasn't passed directly from forum index, discover it from page 1
+    
+            # 1. Discover max page from Page 1 if not provided
             if last_page is None:
                 first_page_html = await self.fetch_page(session, thread_url)
                 if not first_page_html:
                     return []
-
+    
                 soup = BeautifulSoup(first_page_html, "html.parser")
                 page_nav = soup.select("ul.pageNav-main li.pageNav-page, nav.pageNav li.pageNav-page")
                 last_page = 1
                 if page_nav:
-                    try:
-                        page_numbers = [int(p.text.strip()) for p in page_nav if p.text.strip().isdigit()]
-                        if page_numbers:
-                            last_page = max(page_numbers)
-                    except ValueError:
-                        last_page = 1
-
-            logging.info(f"Thread {thread_id} starting reverse scrape from page {last_page}...")
-
-            # 2. Iterate backwards from last_page down to 1
+                    page_numbers = [int(p.text.strip()) for p in page_nav if p.text.strip().isdigit()]
+                    if page_numbers:
+                        last_page = max(page_numbers)
+    
+            logging.info(f"Thread {thread_id}: initiating reverse scrape from page {last_page}...")
+    
+            # 2. Iterate backwards
             for p in range(last_page, 0, -1):
                 page_url = f"{thread_url.rstrip('/')}/page-{p}" if p > 1 else thread_url
                 
@@ -228,15 +225,36 @@ class IGNScraper:
                     html = first_page_html
                 else:
                     html = await self.fetch_page(session, page_url)
-
+    
+                # Handle 404 or missing HTML on initial max page attempt
                 if not html:
+                    if p == last_page and initial_max_page is not None:
+                        logging.info(f"Page {p} returned 404. Checking Page 1 for accurate max page...")
+                        first_page_html = await self.fetch_page(session, thread_url)
+                        if not first_page_html:
+                            break
+                        
+                        soup = BeautifulSoup(first_page_html, "html.parser")
+                        page_nav = soup.select("ul.pageNav-main li.pageNav-page, nav.pageNav li.pageNav-page")
+                        
+                        real_last_page = 1
+                        if page_nav:
+                            page_numbers = [int(n.text.strip()) for n in page_nav if n.text.strip().isdigit()]
+                            if page_numbers:
+                                real_last_page = max(page_numbers)
+                        
+                        if real_last_page < last_page:
+                            logging.info(f"Corrected max page from {last_page} -> {real_last_page}. Re-anchoring sequence.")
+                            return await self.scrape_thread_backwards_async(
+                                thread_url, cutoff_date=cutoff_date, initial_max_page=real_last_page
+                            )
                     continue
-
+    
                 page_soup = BeautifulSoup(html, "html.parser")
                 page_reactions = self.parse_reactions(html, thread_id)
                 all_reactions.extend(page_reactions)
-
-                # Check oldest post timestamp on current page against cutoff_date
+    
+                # Check cutoff timestamp on current page
                 if cutoff_date:
                     time_tags = page_soup.select("article.message time, div.message time")
                     if time_tags:
@@ -244,7 +262,7 @@ class IGNScraper:
                         if oldest_time and oldest_time < cutoff_date:
                             logging.info(f"Reached cutoff date on page {p} of thread {thread_id}. Stopping pagination.")
                             break
-
+    
         return all_reactions
 
     def scrape_thread_backwards(
