@@ -1,187 +1,177 @@
-from datetime import datetime
-import random
-import re
+# scraper.py
+import asyncio
 import time
-from typing import List, Optional, Tuple
+import random
+import logging
+import aiohttp
 from bs4 import BeautifulSoup
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from typing import List, Tuple, Optional
 
-from models import PostMetric
+from config import (
+    CONCURRENT_REQUESTS, 
+    BATCH_SIZE, 
+    DB_COMMIT_INTERVAL, 
+    MAX_RETRIES, 
+    TIMEOUT_SECONDS, 
+    REQUEST_DELAY, 
+    USER_AGENTS
+)
+from db import init_db, get_already_scraped_ids, save_batch_results, save_run_metrics
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
-class IGNScraper:
-    BASE_URL = "https://www.ignboards.com"
+class AsyncReactionTracker:
+    def __init__(self, thread_urls: List[str]):
+        self.thread_urls = thread_urls
+        self.scraped_set = get_already_scraped_ids()
+        self.semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
+        self.pending_reactions: List[Tuple[str, str, str, str]] = []
+        self.pending_scraped_ids: List[str] = []
+        
+        # Performance Tracking Counters
+        self.total_scraped_count = 0
+        self.total_reaction_count = 0
 
-    USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1",
-        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
-    ]
-
-    def __init__(self, max_retries: int = 3):
-        self.session = requests.Session()
-        retries = Retry(
-            total=max_retries,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            raise_on_status=False
-        )
-        adapter = HTTPAdapter(max_retries=retries)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-
-    def _rotate_headers(self) -> None:
-        self.session.headers.update({
-            "User-Agent": random.choice(self.USER_AGENTS),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    def _get_headers(self) -> dict:
+        return {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.5",
-            "Referer": self.BASE_URL,
-        })
+        }
 
-    def _get_soup(self, url: str) -> Optional[BeautifulSoup]:
-        self._rotate_headers()
-        time.sleep(random.uniform(0.5, 1.5))
-        try:
-            res = self.session.get(url, timeout=10)
-            if res.status_code == 200:
-                return BeautifulSoup(res.text, "html.parser")
-            elif res.status_code == 429:
-                time.sleep(5)
-        except requests.RequestException:
-            pass
+    async def fetch_page(self, session: aiohttp.ClientSession, url: str) -> Optional[str]:
+        """Fetches page content using exponential backoff retry logic."""
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                async with self.semaphore:
+                    await asyncio.sleep(REQUEST_DELAY)
+                    async with session.get(url, headers=self._get_headers(), timeout=TIMEOUT_SECONDS) as resp:
+                        if resp.status == 200:
+                            return await resp.text()
+                        elif resp.status == 429:
+                            backoff = (2 ** attempt) + random.uniform(0, 1)
+                            logging.warning(f"Rate limited (429) on {url}. Retrying in {backoff:.2f}s...")
+                            await asyncio.sleep(backoff)
+                        else:
+                            logging.warning(f"HTTP {resp.status} for {url}")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                if attempt == MAX_RETRIES:
+                    logging.error(f"Failed to fetch {url} after {MAX_RETRIES} attempts: {err}")
+                await asyncio.sleep(2 ** attempt)
         return None
 
-    def parse_time(self, time_tag) -> Optional[datetime]:
-        if not time_tag:
-            return None
+    def parse_reactions(self, html: str, thread_id: str) -> List[Tuple[str, str, str, str]]:
+        """Parses thread HTML into reaction tuples."""
+        soup = BeautifulSoup(html, "html.parser")
+        reactions = []
+        
+        posts = soup.select(".message")
+        for post in posts:
+            post_id = post.get("data-content", "unknown")
+            reaction_nodes = post.select(".reactionsBar-link")
+            for node in reaction_nodes:
+                user_name = node.text.strip()
+                reaction_type = node.get("title", "Like")
+                reactions.append((thread_id, post_id, user_name, reaction_type))
+                
+        return reactions
 
-        if time_tag.has_attr("data-time"):
-            try:
-                return datetime.fromtimestamp(int(time_tag["data-time"]))
-            except ValueError:
-                pass
+    async def process_thread(self, session: aiohttp.ClientSession, url: str):
+        thread_id = url.rstrip("/").split("/")[-1]
+        
+        if thread_id in self.scraped_set:
+            return
 
-        if time_tag.has_attr("datetime"):
-            try:
-                dt_str = time_tag["datetime"].replace("Z", "+00:00")
-                return datetime.fromisoformat(dt_str).replace(tzinfo=None)
-            except ValueError:
-                pass
-
-        return None
-
-    def get_board_threads(self, board_url: str, page: int = 1) -> List[BeautifulSoup]:
-        """Fetches a specific page of the board index and returns thread item tags."""
-        url = board_url.rstrip("/")
-        if page > 1:
-            url = f"{url}/page-{page}"
+        thread_start_time = time.perf_counter()
+        html = await self.fetch_page(session, url)
+        
+        if html:
+            extracted = self.parse_reactions(html, thread_id)
+            thread_duration = time.perf_counter() - thread_start_time
             
-        soup = self._get_soup(url)
-        if not soup:
-            return []
-        return soup.select(".structItem--thread")
-
-    def extract_post_reactions(self, post_soup: BeautifulSoup) -> Tuple[int, List[str]]:
-        reaction_bar = post_soup.select_one(".reactionsBar.is-active, .js-reactionsList.is-active, .reactionsBar")
-        if not reaction_bar:
-            return 0, []
-
-        reactors = []
-
-        member_links = reaction_bar.select("a[href*='/members/'], a.reactionsBar-link")
-        for link in member_links:
-            username = link.get_text(strip=True)
-            if username and not re.search(r"\b\d+\s+other", username, re.IGNORECASE):
-                if username not in reactors:
-                    reactors.append(username)
-
-        bar_text = reaction_bar.get_text(" ", strip=True)
-
-        if not reactors:
-            clean_text = re.sub(r'and\s+\d+\s+others?.*$', '', bar_text, flags=re.IGNORECASE).strip()
-            clean_text = re.sub(r'\band\b', ',', clean_text, flags=re.IGNORECASE)
-            for name in clean_text.split(','):
-                name = name.strip()
-                if name and name not in reactors:
-                    reactors.append(name)
-
-        others_match = re.search(r"and\s+(\d+)\s+other", bar_text, re.IGNORECASE)
-        others_count = int(others_match.group(1)) if others_match else 0
-
-        total_reaction_count = len(reactors) + others_count
-        return total_reaction_count, reactors
-
-    def parse_posts_from_page(
-        self, soup: BeautifulSoup, cutoff_date: datetime
-    ) -> Tuple[List[PostMetric], bool]:
-        posts = []
-        hit_cutoff = False
-
-        post_elements = soup.select("article.message--post, .js-post")
-
-        for post_elem in post_elements:
-            time_tag = post_elem.select_one("time.u-dt")
-            post_time = self.parse_time(time_tag)
-
-            if post_time and post_time < cutoff_date:
-                hit_cutoff = True
-                continue
-
-            author = post_elem.get("data-author", "Unknown")
+            self.pending_reactions.extend(extracted)
+            self.pending_scraped_ids.append(thread_id)
+            self.scraped_set.add(thread_id)
             
-            permalink_tag = post_elem.select_one("a[href*='/posts/']")
-            post_url = ""
-            if permalink_tag and permalink_tag.has_attr("href"):
-                href = permalink_tag["href"]
-                post_url = self.BASE_URL + href if href.startswith("/") else href
+            self.total_scraped_count += 1
+            self.total_reaction_count += len(extracted)
 
-            content_elem = post_elem.select_one(".message-body, .js-selectToQuote")
-            content_snippet = content_elem.get_text(" ", strip=True)[:300] if content_elem else ""
-
-            reaction_count, reactors = self.extract_post_reactions(post_elem)
-
-            posts.append(
-                PostMetric(
-                    author=author,
-                    created_at=post_time or datetime.now(),
-                    reaction_count=reaction_count,
-                    reactors=reactors,
-                    post_url=post_url,
-                    content_snippet=content_snippet,
-                )
+            logging.info(
+                f"Scraped {thread_id} | "
+                f"Time: {thread_duration:.2f}s | "
+                f"Reactions: {len(extracted)}"
             )
 
-        return posts, hit_cutoff
+            if len(self.pending_scraped_ids) >= DB_COMMIT_INTERVAL:
+                self.flush_to_db()
 
-    def scrape_thread_backwards(
-        self, thread_url: str, cutoff_date: datetime, initial_max_page: int = 1
-    ) -> List[PostMetric]:
-        all_thread_posts = []
-        current_page = initial_max_page
+    def flush_to_db(self):
+        """Commits cached results to SQLite and clears local buffer."""
+        if self.pending_scraped_ids:
+            save_batch_results(self.pending_reactions, self.pending_scraped_ids)
+            logging.info(f" Flushed {len(self.pending_scraped_ids)} threads to database.")
+            self.pending_reactions.clear()
+            self.pending_scraped_ids.clear()
 
-        while current_page >= 1:
-            page_url = f"{thread_url}page-{current_page}" if current_page > 1 else thread_url
-            soup = self._get_soup(page_url)
+    async def run(self):
+        """Executes scrape in session batches with precise run-time tracking."""
+        init_db()
+        unscraped_urls = [u for u in self.thread_urls if u.rstrip("/").split("/")[-1] not in self.scraped_set]
+        total_remaining = len(unscraped_urls)
+        
+        if total_remaining == 0:
+            logging.info("All target threads have already been scraped.")
+            return
 
-            if not soup:
-                break
+        logging.info(f"Starting run for {total_remaining} threads.")
+        run_start_time = time.perf_counter()
 
-            posts, hit_cutoff = self.parse_posts_from_page(soup, cutoff_date)
-            all_thread_posts.extend(posts)
+        for i in range(0, total_remaining, BATCH_SIZE):
+            batch_urls = unscraped_urls[i:i + BATCH_SIZE]
+            batch_num = (i // BATCH_SIZE) + 1
+            batch_start_time = time.perf_counter()
+            
+            logging.info(f"--- Batch {batch_num} Starting ({len(batch_urls)} threads) ---")
+            
+            async with aiohttp.ClientSession() as session:
+                tasks = [self.process_thread(session, url) for url in batch_urls]
+                await asyncio.gather(*tasks)
 
-            if hit_cutoff or current_page == 1:
-                break
+            self.flush_to_db()
+            
+            # Batch level performance logging
+            batch_elapsed = time.perf_counter() - batch_start_time
+            avg_thread_time = batch_elapsed / len(batch_urls) if len(batch_urls) > 0 else 0
+            logging.info(
+                f"--- Batch {batch_num} Finished | "
+                f"Batch Time: {batch_elapsed:.2f}s | "
+                f"Avg per thread: {avg_thread_time:.2f}s ---"
+            )
+            
+            await asyncio.sleep(2)
 
-            current_page -= 1
+        total_elapsed = time.perf_counter() - run_start_time
+        avg_per_thread = total_elapsed / self.total_scraped_count if self.total_scraped_count > 0 else 0
+        threads_per_min = (self.total_scraped_count / (total_elapsed / 60.0)) if total_elapsed > 0 else 0
 
-        return all_thread_posts
+        # Save metrics to database
+        save_run_metrics(self.total_scraped_count, self.total_reaction_count, total_elapsed)
+
+        # Print Final Summary Dashboard
+        print("\n" + "="*50)
+        print("              RUN TIME SUMMARY               ")
+        print("="*50)
+        print(f"Total Threads Processed: {self.total_scraped_count}")
+        print(f"Total Reactions Extracted: {self.total_reaction_count}")
+        print(f"Total Elapsed Time:      {total_elapsed:.2f} seconds ({total_elapsed/60:.2f} mins)")
+        print(f"Average Time per Thread: {avg_per_thread:.2f} seconds")
+        print(f"Processing Throughput:   {threads_per_min:.2f} threads/min")
+        print("="*50 + "\n")
+
+if __name__ == "__main__":
+    sample_urls = [f"https://example-forum.com/threads/sample-topic-{i}" for i in range(1, 500)]
+    tracker = AsyncReactionTracker(sample_urls)
+    asyncio.run(tracker.run())
