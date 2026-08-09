@@ -173,7 +173,7 @@ class IGNScraper:
             try:
                 async with self.semaphore:
                     # Add randomized jitter to request delay to prevent cadence detection
-                    jittered_delay = REQUEST_DELAY + random.uniform(0.1, 0.5)
+                    jittered_delay = REQUEST_DELAY + random.uniform(0.5, 1.5)
                     await asyncio.sleep(jittered_delay)
                     
                     # Fetch fresh headers (including rotated UA) for each individual attempt
