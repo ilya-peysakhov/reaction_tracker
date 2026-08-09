@@ -9,15 +9,26 @@ from bs4 import BeautifulSoup, Tag
 from typing import List, Tuple, Optional, Set, Union
 from urllib.parse import urljoin
 
-from config import (
-    CONCURRENT_REQUESTS, 
-    BATCH_SIZE, 
-    DB_COMMIT_INTERVAL, 
-    MAX_RETRIES, 
-    TIMEOUT_SECONDS, 
-    REQUEST_DELAY, 
-    USER_AGENTS
-)
+try:
+    from config import (
+        CONCURRENT_REQUESTS, 
+        BATCH_SIZE, 
+        DB_COMMIT_INTERVAL, 
+        MAX_RETRIES, 
+        TIMEOUT_SECONDS, 
+        REQUEST_DELAY, 
+        USER_AGENTS as CONFIG_USER_AGENTS
+    )
+except ImportError:
+    # Fallback configuration standard defaults if config missing
+    CONCURRENT_REQUESTS = 5
+    BATCH_SIZE = 20
+    DB_COMMIT_INTERVAL = 10
+    MAX_RETRIES = 3
+    TIMEOUT_SECONDS = 15
+    REQUEST_DELAY = 1.0
+    CONFIG_USER_AGENTS = []
+
 from db import init_db, get_already_scraped_ids, save_batch_results, save_run_metrics
 from models import Post
 
@@ -26,10 +37,28 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
+# Diverse fallback list of recent real-world browser user agents
+EXPANDED_USER_AGENTS = [
+    # Chrome (Windows, macOS, Linux)
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    # Firefox (Windows, macOS, Linux)
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:127.0) Gecko/20100101 Firefox/127.0",
+    # Safari (macOS, iOS)
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    # Edge (Windows, macOS)
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/126.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+]
+
 class IGNScraper:
     """
     Async scraper for IGN Boards reaction tracking. Handles forum discovery, 
-    reverse pagination, bounded concurrency, and session batching.
+    reverse pagination, bounded concurrency, session batching, and per-request User-Agent rotation.
     """
     BASE_URL = "https://www.ignboards.com"
 
@@ -43,15 +72,28 @@ class IGNScraper:
         self.pending_reactions: List[Tuple[str, str, str, str]] = []
         self.pending_scraped_ids: List[str] = []
         
+        # Combine config user agents with fallback pool to maximize diversity
+        self.user_agent_pool = list(set(CONFIG_USER_AGENTS + EXPANDED_USER_AGENTS))
+        
         # Performance & Benchmark Tracking
         self.total_scraped_count = 0
         self.total_reaction_count = 0
 
     def _get_headers(self) -> dict:
+        """Generates dynamic HTTP headers with a newly rotated User-Agent per call."""
+        ua = random.choice(self.user_agent_pool)
         return {
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
         }
 
     @staticmethod
@@ -83,14 +125,20 @@ class IGNScraper:
 
     async def fetch_page(self, session: aiohttp.ClientSession, url: str) -> Optional[str]:
         """
-        Fetches page content with exponential backoff on retries or 429s.
+        Fetches page content with rotated User-Agent on every request and retry attempt.
         Exits IMMEDIATELY without retrying on 404 (Not Found) or 403 (Forbidden).
         """
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 async with self.semaphore:
-                    await asyncio.sleep(REQUEST_DELAY)
-                    async with session.get(url, headers=self._get_headers(), timeout=TIMEOUT_SECONDS) as resp:
+                    # Add randomized jitter to request delay to prevent cadence detection
+                    jittered_delay = REQUEST_DELAY + random.uniform(0.1, 0.5)
+                    await asyncio.sleep(jittered_delay)
+                    
+                    # Fetch fresh headers (including rotated UA) for each individual attempt
+                    headers = self._get_headers()
+                    
+                    async with session.get(url, headers=headers, timeout=TIMEOUT_SECONDS) as resp:
                         if resp.status == 200:
                             return await resp.text()
                         
@@ -100,16 +148,16 @@ class IGNScraper:
                             return None
                             
                         elif resp.status == 429:
-                            backoff = (2 ** attempt) + random.uniform(0, 1)
-                            logging.warning(f"Rate limited (429) on {url}. Retrying in {backoff:.2f}s...")
+                            backoff = (2 ** attempt) + random.uniform(1.0, 3.0)
+                            logging.warning(f"Rate limited (429) on {url}. Backing off for {backoff:.2f}s (Attempt {attempt}/{MAX_RETRIES})...")
                             await asyncio.sleep(backoff)
                         else:
-                            logging.warning(f"HTTP {resp.status} for {url}")
+                            logging.warning(f"HTTP {resp.status} for {url} on attempt {attempt}")
                             
             except (aiohttp.ClientError, asyncio.TimeoutError) as err:
                 if attempt == MAX_RETRIES:
                     logging.error(f"Failed to fetch {url} after {MAX_RETRIES} attempts: {err}")
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
                 
         return None
 
@@ -347,7 +395,7 @@ class IGNScraper:
                 self.flush_to_db()
 
     def flush_to_db(self):
-        """Commits cached reaction records to SQLite/DuckDB in a single transaction."""
+        """Commits cached reaction records to database in a single transaction."""
         if self.pending_scraped_ids:
             save_batch_results(self.pending_reactions, self.pending_scraped_ids)
             logging.info(f"Flushed {len(self.pending_scraped_ids)} threads to database.")
@@ -388,6 +436,7 @@ class IGNScraper:
                 f"Avg per thread: {avg_thread_time:.2f}s ---"
             )
             
+            # Brief pause between batches to allow connection recycling
             await asyncio.sleep(2)
 
         total_elapsed = time.perf_counter() - run_start_time
