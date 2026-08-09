@@ -28,3 +28,13 @@ class AggregatedMetrics:
     most_reacted_posts: List[PostMetric] = field(default_factory=list)
     total_posts: int = 0
     total_reactions: int = 0
+
+@dataclass
+class Post:
+    thread_id: str
+    post_id: str
+    username: str
+    reaction_type: str = "Like"
+    reaction_count: int = 1
+    post_date: Optional[datetime] = None
+    thread_title: Optional[str] = None
