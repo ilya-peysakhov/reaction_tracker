@@ -379,34 +379,33 @@ class IGNScraper:
             )
         )
 
-    async def process_thread(self, session: aiohttp.ClientSession, url: str):
+      async def process_thread(self, session: aiohttp.ClientSession, url: str):
         """Scrapes a single thread URL and measures execution time."""
         thread_id = url.rstrip("/").split("/")[-1]
-        
+
         if thread_id in self.scraped_set:
             return
 
         thread_start_time = time.perf_counter()
         html = await self.fetch_page(session, url)
-        
+
         if html:
             extracted = self.parse_reactions(html, thread_id)
             thread_duration = time.perf_counter() - thread_start_time
-            
-            # Convert Post instances to tuple format expected by save_batch_results
+
             for post in extracted:
-                self.pending_reactions.append((post.thread_id, post.post_id, post.username, post.reaction_type))
-                
+                self.pending_reactions.append(
+                    (post.thread_id, post.post_id, post.giver_username, post.author_username, post.reaction_type)
+                )
+
             self.pending_scraped_ids.append(thread_id)
             self.scraped_set.add(thread_id)
-            
+
             self.total_scraped_count += 1
             self.total_reaction_count += len(extracted)
 
             logging.info(
-                f"Scraped {thread_id} | "
-                f"Time: {thread_duration:.2f}s | "
-                f"Reactions: {len(extracted)}"
+                f"Scraped {thread_id} | Time: {thread_duration:.2f}s | Reactions: {len(extracted)}"
             )
 
             if len(self.pending_scraped_ids) >= DB_COMMIT_INTERVAL:
