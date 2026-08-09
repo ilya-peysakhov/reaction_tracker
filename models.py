@@ -33,8 +33,14 @@ class AggregatedMetrics:
 class Post:
     thread_id: str
     post_id: str
-    username: str
+    username: str                     # User who gave the reaction
+    author: Optional[str] = None      # User who wrote the post (reaction recipient)
     reaction_type: str = "Like"
     reaction_count: int = 1
     post_date: Optional[datetime] = None
     thread_title: Optional[str] = None
+
+    @property
+    def reactors(self) -> List[str]:
+        """Fallback list of reaction givers for aggregator compatibility."""
+        return [self.username] if self.username else []
