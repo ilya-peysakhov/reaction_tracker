@@ -4,8 +4,9 @@ import time
 import random
 import logging
 import aiohttp
-from bs4 import BeautifulSoup
-from typing import List, Tuple, Optional, Set
+from datetime import datetime
+from bs4 import BeautifulSoup, Tag
+from typing import List, Tuple, Optional, Set, Union
 from urllib.parse import urljoin
 
 from config import (
@@ -52,6 +53,29 @@ class IGNScraper:
             "Accept-Language": "en-US,en;q=0.5",
         }
 
+    @staticmethod
+    def parse_time(time_tag: Optional[Tag]) -> Optional[datetime]:
+        """
+        Parses XenForo/IGN timestamp tags (<time datetime="..."> or <time data-time="...">).
+        """
+        if not time_tag:
+            return None
+            
+        dt_str = time_tag.get("datetime") or time_tag.get("data-time")
+        if not dt_str:
+            return None
+            
+        try:
+            # Handle numeric epoch timestamp string
+            if str(dt_str).isdigit():
+                return datetime.fromtimestamp(int(dt_str))
+            
+            # ISO 8601 parsing
+            dt_str_clean = str(dt_str).replace("Z", "+00:00")
+            return datetime.fromisoformat(dt_str_clean)
+        except Exception:
+            return None
+
     async def fetch_page(self, session: aiohttp.ClientSession, url: str) -> Optional[str]:
         """Fetches page content with exponential backoff on retries or 429s."""
         for attempt in range(1, MAX_RETRIES + 1):
@@ -77,19 +101,15 @@ class IGNScraper:
         self, 
         board_url: str, 
         page: Optional[int] = None, 
-        max_pages: int = 1
-    ) -> List[str]:
+        max_pages: int = 1,
+        return_elements: bool = True
+    ) -> Union[List[Tag], List[str]]:
         """
-        Asynchronously parses forum index pages and collects individual thread URLs.
-        Supports single page targets via `page` or a sequence using `max_pages`.
+        Asynchronously fetches index pages and returns either BeautifulSoup 
+        `structItem` elements (for timestamp/cutoff checks) or clean URL strings.
         """
-        discovered_urls: List[str] = []
-        
-        # Determine target page numbers
-        if page is not None:
-            pages_to_fetch = [page]
-        else:
-            pages_to_fetch = list(range(1, max_pages + 1))
+        discovered_items = []
+        pages_to_fetch = [page] if page is not None else list(range(1, max_pages + 1))
 
         async with aiohttp.ClientSession() as session:
             for p in pages_to_fetch:
@@ -101,32 +121,46 @@ class IGNScraper:
                     continue
                 
                 soup = BeautifulSoup(html, "html.parser")
-                # XenForo / IGN Boards thread title link selectors
-                thread_links = soup.select("div.structItem-title a[data-tp-primary], a[href*='/threads/']")
                 
-                for link in thread_links:
-                    href = link.get("href")
-                    if href and "/threads/" in href:
-                        full_url = urljoin(self.BASE_URL, href)
-                        # Clean off page query parameters or post anchors
-                        clean_url = full_url.split("page-")[0].split("#")[0].rstrip("/")
-                        if clean_url not in discovered_urls:
-                            discovered_urls.append(clean_url)
+                if return_elements:
+                    # Select XenForo thread row elements directly
+                    thread_rows = soup.select(".structItem--thread, div.structItem")
+                    discovered_items.extend(thread_rows)
+                else:
+                    thread_links = soup.select("div.structItem-title a[data-tp-primary], a[href*='/threads/']")
+                    for link in thread_links:
+                        href = link.get("href")
+                        if href and "/threads/" in href:
+                            full_url = urljoin(self.BASE_URL, href)
+                            clean_url = full_url.split("page-")[0].split("#")[0].rstrip("/")
+                            if clean_url not in discovered_items:
+                                discovered_items.append(clean_url)
                             
-        logging.info(f"Discovered {len(discovered_urls)} unique thread URLs.")
-        return discovered_urls
+        return discovered_items
 
     def get_board_threads(
         self, 
         board_url: str, 
         page: Optional[int] = None, 
-        max_pages: int = 1
-    ) -> List[str]:
+        max_pages: int = 1,
+        return_elements: bool = True
+    ) -> Union[List[Tag], List[str]]:
         """
-        Synchronous wrapper for discovering threads on board index pages.
-        Accepts both `page` and `max_pages` keyword arguments.
+        Synchronous wrapper for discovering board threads. 
+        Returns BeautifulSoup Tag elements by default so callers can call `.select_one()`.
         """
-        return asyncio.run(self.get_board_threads_async(board_url, page=page, max_pages=max_pages))
+        return asyncio.run(
+            self.get_board_threads_async(board_url, page=page, max_pages=max_pages, return_elements=return_elements)
+        )
+
+    @staticmethod
+    def extract_thread_url(thread_element: Tag) -> Optional[str]:
+        """Helper to safely extract the full thread URL from a structItem element."""
+        link = thread_element.select_one("div.structItem-title a[data-tp-primary], a[href*='/threads/']")
+        if link and link.get("href"):
+            full_url = urljoin("https://boards.ign.com", link["href"])
+            return full_url.split("page-")[0].split("#")[0].rstrip("/")
+        return None
 
     def parse_reactions(self, html: str, thread_id: str) -> List[Tuple[str, str, str, str]]:
         """Parses IGN Boards post HTML and extracts post IDs, usernames, and reaction types."""
