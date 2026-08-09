@@ -1,18 +1,17 @@
+# aggregator.py
 from collections import Counter
-from typing import List, Tuple
-from models import PostMetric, ThreadMetric, AggregatedMetrics
-
+from typing import List, Tuple, Any
 
 class MetricsAggregator:
-    def __init__(self, posts: List[PostMetric], threads: List[ThreadMetric]):
+    def __init__(self, posts: List[Any], thread_summaries: List[Any] = None):
         self.posts = posts
-        self.threads = threads
+        self.thread_summaries = thread_summaries or []
 
-    def get_top_reaction_givers(self, limit: int = 10):
+    def get_top_reaction_givers(self, limit: int = 10) -> List[Tuple[str, int]]:
         """Calculates users who gave the most reactions."""
         giver_counts = Counter()
         for post in self.posts:
-            # Check if post has a 'reactors' list or if post.username is the giver
+            # Check for reactors attribute, username field, or dict key
             if hasattr(post, "reactors") and post.reactors:
                 for reactor in post.reactors:
                     giver_counts[reactor] += 1
@@ -22,34 +21,32 @@ class MetricsAggregator:
                 user = post.get("username")
                 if user:
                     giver_counts[user] += 1
-                    
+
         return giver_counts.most_common(limit)
 
     def get_top_reaction_getters(self, limit: int = 10) -> List[Tuple[str, int]]:
-        """
-        Counts total reactions received by post author across all scraped posts.
-        """
+        """Calculates users who received the most reactions."""
         getter_counts = Counter()
         for post in self.posts:
-            if post.reaction_count > 0:
-                getter_counts[post.author] += post.reaction_count
+            # Fall back safely from author -> username if author is missing
+            author = getattr(post, "author", None) or getattr(post, "username", None)
+            if isinstance(post, dict):
+                author = post.get("author") or post.get("username")
+
+            count = getattr(post, "reaction_count", 1) if not isinstance(post, dict) else post.get("reaction_count", 1)
+
+            if author and count > 0:
+                getter_counts[author] += count
+
         return getter_counts.most_common(limit)
 
-    def get_most_reacted_posts(self, limit: int = 10) -> List[PostMetric]:
-        """
-        Returns posts sorted by highest reaction count.
-        """
-        return sorted(self.posts, key=lambda p: p.reaction_count, reverse=True)[:limit]
+    def get_most_reacted_posts(self, limit: int = 10) -> List[Any]:
+        """Returns top posts sorted by reaction count."""
+        def get_count(p):
+            if hasattr(p, "reaction_count"):
+                return p.reaction_count
+            if isinstance(p, dict):
+                return p.get("reaction_count", 1)
+            return 1
 
-    def get_summary_metrics() -> AggregatedMetrics:
-        """
-        Returns a dataclass containing all compiled dashboard metrics.
-        """
-        total_rxns = sum(t.total_reactions for t in self.threads)
-        return AggregatedMetrics(
-            top_givers=self.get_top_reaction_givers(),
-            top_getters=self.get_top_reaction_getters(),
-            most_reacted_posts=self.get_most_reacted_posts(),
-            total_posts=len(self.posts),
-            total_reactions=total_rxns,
-        )
+        return sorted(self.posts, key=get_count, reverse=True)[:limit]
