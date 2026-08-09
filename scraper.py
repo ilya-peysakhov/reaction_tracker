@@ -222,37 +222,55 @@ class IGNScraper:
             return full_url.split("page-")[0].split("#")[0].rstrip("/")
         return None
 
-    def parse_reactions(self, html: str, thread_id: str) -> List[Post]:
-        """Parses IGN Boards post HTML and returns mutable Post objects."""
-        soup = BeautifulSoup(html, "html.parser")
-        reactions: List[Post] = []
-        
-        posts = soup.select("article.message, div.message-inner")
-        for post in posts:
-            post_id = post.get("data-content", "unknown")
-            if post_id == "unknown":
-                post_id = post.get("id", "unknown")
-            
-            time_tag = post.select_one("time")
-            post_dt = self.parse_time(time_tag)
-
-            reaction_nodes = post.select(".reactionsBar-link, .sv-rate-type")
-            for node in reaction_nodes:
-                user_name = node.text.strip()
-                reaction_type = node.get("title", "Like")
+     def parse_reactions(self, html: str, thread_id: str) -> List[Post]:
+            """Parses XenForo post HTML, mapping post authors vs reaction givers correctly."""
+            soup = BeautifulSoup(html, "html.parser")
+            reactions: List[Post] = []
+    
+            posts = soup.select("article.message, div.message-inner")
+            for post in posts:
+                post_id = post.get("data-content") or post.get("id") or "unknown"
+                if "post-" in str(post_id):
+                    post_id = str(post_id).replace("post-", "")
+    
+                time_tag = post.select_one("time")
+                post_dt = self.parse_time(time_tag)
+    
+                # 1. EXTRACT POST AUTHOR (GETTER)
+                post_author = post.get("data-author")
+                if not post_author:
+                    author_tag = post.select_one("a.username, .message-user text, [data-user-id]")
+                    post_author = author_tag.text.strip() if author_tag else "UnknownAuthor"
+    
+                # Extract raw post body content if present
+                body_tag = post.select_one(".message-body, .js-selectToQuote")
+                text_content = body_tag.get_text(strip=True) if body_tag else None
+    
+                # 2. EXTRACT REACTION GIVERS
+                reaction_nodes = post.select(".reactionsBar-link a, .sv-rate-type")
                 
-                reactions.append(
-                    Post(
-                        thread_id=thread_id,
-                        post_id=post_id,
-                        username=user_name,
-                        reaction_type=reaction_type,
-                        reaction_count=1,
-                        post_date=post_dt
+                for node in reaction_nodes:
+                    giver_name = node.text.strip()
+                    reaction_type = node.get("title", "Like")
+    
+                    # Filter out generic summary labels like "12 others" or "and 2 more..."
+                    if "other" in giver_name.lower() or "more" in giver_name.lower():
+                        continue
+    
+                    reactions.append(
+                        Post(
+                            thread_id=thread_id,
+                            post_id=post_id,
+                            giver_username=giver_name,
+                            author_username=post_author,
+                            reaction_type=reaction_type,
+                            reaction_count=1,
+                            post_date=post_dt,
+                            text_content=text_content
+                        )
                     )
-                )
-                
-        return reactions
+    
+            return reactions
 
     async def scrape_thread_backwards_async(
         self, 
