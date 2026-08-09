@@ -19,6 +19,7 @@ from config import (
     USER_AGENTS
 )
 from db import init_db, get_already_scraped_ids, save_batch_results, save_run_metrics
+from models import Post
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,7 +68,6 @@ class IGNScraper:
             return None
             
         try:
-            dt = None
             if str(dt_str).isdigit():
                 dt = datetime.fromtimestamp(int(dt_str))
             else:
@@ -82,7 +82,7 @@ class IGNScraper:
             return None
 
     async def fetch_page(self, session: aiohttp.ClientSession, url: str) -> Optional[str]:
-        """Fetches page content with exponential backoff on retries or 429s."""
+        """Fetches page content with exponential backoff on retries or 429s, exiting immediately on 404."""
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 async with self.semaphore:
@@ -90,6 +90,10 @@ class IGNScraper:
                     async with session.get(url, headers=self._get_headers(), timeout=TIMEOUT_SECONDS) as resp:
                         if resp.status == 200:
                             return await resp.text()
+                        elif resp.status == 404:
+                            # Instant return on 404 to skip non-existent/deleted pages cleanly
+                            logging.debug(f"HTTP 404 for {url}")
+                            return None
                         elif resp.status == 429:
                             backoff = (2 ** attempt) + random.uniform(0, 1)
                             logging.warning(f"Rate limited (429) on {url}. Retrying in {backoff:.2f}s...")
@@ -149,9 +153,7 @@ class IGNScraper:
         max_pages: int = 1,
         return_elements: bool = True
     ) -> Union[List[Tag], List[str]]:
-        """
-        Synchronous wrapper for discovering board threads.
-        """
+        """Synchronous wrapper for discovering board threads."""
         return asyncio.run(
             self.get_board_threads_async(board_url, page=page, max_pages=max_pages, return_elements=return_elements)
         )
@@ -161,14 +163,14 @@ class IGNScraper:
         """Helper to safely extract the full thread URL from a structItem element."""
         link = thread_element.select_one("div.structItem-title a[data-tp-primary], a[href*='/threads/']")
         if link and link.get("href"):
-            full_url = urljoin("https://boards.ign.com", link["href"])
+            full_url = urljoin("https://www.ignboards.com", link["href"])
             return full_url.split("page-")[0].split("#")[0].rstrip("/")
         return None
 
-    def parse_reactions(self, html: str, thread_id: str) -> List[Tuple[str, str, str, str]]:
-        """Parses IGN Boards post HTML and extracts post IDs, usernames, and reaction types."""
+    def parse_reactions(self, html: str, thread_id: str) -> List[Post]:
+        """Parses IGN Boards post HTML and returns mutable Post objects."""
         soup = BeautifulSoup(html, "html.parser")
-        reactions = []
+        reactions: List[Post] = []
         
         posts = soup.select("article.message, div.message-inner")
         for post in posts:
@@ -176,11 +178,24 @@ class IGNScraper:
             if post_id == "unknown":
                 post_id = post.get("id", "unknown")
             
+            time_tag = post.select_one("time")
+            post_dt = self.parse_time(time_tag)
+
             reaction_nodes = post.select(".reactionsBar-link, .sv-rate-type")
             for node in reaction_nodes:
                 user_name = node.text.strip()
                 reaction_type = node.get("title", "Like")
-                reactions.append((thread_id, post_id, user_name, reaction_type))
+                
+                reactions.append(
+                    Post(
+                        thread_id=thread_id,
+                        post_id=post_id,
+                        username=user_name,
+                        reaction_type=reaction_type,
+                        reaction_count=1,
+                        post_date=post_dt
+                    )
+                )
                 
         return reactions
 
@@ -189,26 +204,25 @@ class IGNScraper:
         thread_url: str, 
         cutoff_date: Optional[datetime] = None,
         initial_max_page: Optional[int] = None
-    ) -> List[Tuple[str, str, str, str]]:
+    ) -> List[Post]:
         """
         Asynchronously fetches thread pages in reverse order.
-        Safely handles 404s on deleted threads and avoids recursive fallback loops.
+        Uses initial_max_page as a fast path with auto-fallback to Page 1 verification on 404s.
         """
         thread_id = thread_url.rstrip("/").split("/")[-1]
-        all_reactions = []
-    
+        all_reactions: List[Post] = []
+
         async with aiohttp.ClientSession() as session:
             first_page_html = None
             last_page = initial_max_page
-    
-            # 1. Discover max page from Page 1 if initial_max_page was not passed
+
+            # 1. Discover max page from Page 1 if not passed
             if last_page is None:
                 first_page_html = await self.fetch_page(session, thread_url)
-                # If Page 1 returns 404, the thread is deleted/inaccessible. Abort immediately.
                 if not first_page_html:
                     logging.warning(f"Thread {thread_id} returned 404 on initial fetch. Skipping deleted thread.")
                     return []
-    
+
                 soup = BeautifulSoup(first_page_html, "html.parser")
                 page_nav = soup.select("ul.pageNav-main li.pageNav-page, nav.pageNav li.pageNav-page")
                 last_page = 1
@@ -216,10 +230,10 @@ class IGNScraper:
                     page_numbers = [int(p.text.strip()) for p in page_nav if p.text.strip().isdigit()]
                     if page_numbers:
                         last_page = max(page_numbers)
-    
+
             logging.info(f"Thread {thread_id}: initiating reverse scrape from page {last_page}...")
-    
-            # 2. Iterate backwards
+
+            # 2. Iterate backwards from last_page to 1
             for p in range(last_page, 0, -1):
                 page_url = f"{thread_url.rstrip('/')}/page-{p}" if p > 1 else thread_url
                 
@@ -227,22 +241,19 @@ class IGNScraper:
                     html = first_page_html
                 else:
                     html = await self.fetch_page(session, page_url)
-    
-                # Handle 404 or failed page fetches
+
                 if not html:
-                    # If Page 1 specifically fails during reverse iteration, the thread is deleted
                     if p == 1:
-                        logging.warning(f"Thread {thread_id} Page 1 returned 404. Skipping remaining processing.")
+                        logging.warning(f"Thread {thread_id} Page 1 returned 404. Skipping thread.")
                         break
-    
-                    # If a high page (e.g., page 438) returns 404, check Page 1 ONCE to re-anchor
+
+                    # Fallback on stale initial_max_page 404s
                     if p == last_page and initial_max_page is not None:
-                        logging.info(f"Page {p} returned 404. Checking Page 1 for actual thread max page...")
+                        logging.info(f"Page {p} returned 404. Checking Page 1 for actual max page...")
                         first_page_html = await self.fetch_page(session, thread_url)
                         
-                        # Page 1 failed -> Thread is deleted
                         if not first_page_html:
-                            logging.warning(f"Thread {thread_id} Page 1 is inaccessible (404). Aborting.")
+                            logging.warning(f"Thread {thread_id} Page 1 inaccessible (404). Aborting.")
                             break
                         
                         soup = BeautifulSoup(first_page_html, "html.parser")
@@ -254,7 +265,6 @@ class IGNScraper:
                             if page_numbers:
                                 real_last_page = max(page_numbers)
                         
-                        # Avoid infinite recursion: only restart if real_last_page is strictly lower than p
                         if real_last_page < last_page:
                             logging.info(f"Corrected max page from {last_page} -> {real_last_page}. Re-anchoring sequence.")
                             return await self.scrape_thread_backwards_async(
@@ -263,13 +273,13 @@ class IGNScraper:
                         else:
                             logging.warning(f"Could not resolve valid pages for {thread_id}. Skipping.")
                             break
-    
+
                     continue
-    
+
                 page_soup = BeautifulSoup(html, "html.parser")
                 page_reactions = self.parse_reactions(html, thread_id)
                 all_reactions.extend(page_reactions)
-    
+
                 # Check cutoff timestamp on current page
                 if cutoff_date:
                     time_tags = page_soup.select("article.message time, div.message time")
@@ -278,7 +288,7 @@ class IGNScraper:
                         if oldest_time and oldest_time < cutoff_date:
                             logging.info(f"Reached cutoff date on page {p} of thread {thread_id}. Stopping pagination.")
                             break
-    
+
         return all_reactions
 
     def scrape_thread_backwards(
@@ -286,11 +296,8 @@ class IGNScraper:
         thread_url: str, 
         cutoff_date: Optional[datetime] = None,
         initial_max_page: Optional[int] = None
-    ) -> List[Tuple[str, str, str, str]]:
-        """
-        Synchronous wrapper for reverse-pagination thread scraping.
-        Accepts `initial_max_page` passed from thread card pagination parsing.
-        """
+    ) -> List[Post]:
+        """Synchronous wrapper for reverse-pagination thread scraping."""
         return asyncio.run(
             self.scrape_thread_backwards_async(
                 thread_url, 
@@ -313,7 +320,10 @@ class IGNScraper:
             extracted = self.parse_reactions(html, thread_id)
             thread_duration = time.perf_counter() - thread_start_time
             
-            self.pending_reactions.extend(extracted)
+            # Convert Post instances to tuple format expected by save_batch_results
+            for post in extracted:
+                self.pending_reactions.append((post.thread_id, post.post_id, post.username, post.reaction_type))
+                
             self.pending_scraped_ids.append(thread_id)
             self.scraped_set.add(thread_id)
             
@@ -330,10 +340,10 @@ class IGNScraper:
                 self.flush_to_db()
 
     def flush_to_db(self):
-        """Commits cached reaction records to SQLite in a single transaction."""
+        """Commits cached reaction records to SQLite/DuckDB in a single transaction."""
         if self.pending_scraped_ids:
             save_batch_results(self.pending_reactions, self.pending_scraped_ids)
-            logging.info(f" Flushed {len(self.pending_scraped_ids)} threads to database.")
+            logging.info(f"Flushed {len(self.pending_scraped_ids)} threads to database.")
             self.pending_reactions.clear()
             self.pending_scraped_ids.clear()
 
@@ -377,10 +387,8 @@ class IGNScraper:
         avg_per_thread = total_elapsed / self.total_scraped_count if self.total_scraped_count > 0 else 0
         threads_per_min = (self.total_scraped_count / (total_elapsed / 60.0)) if total_elapsed > 0 else 0
 
-        # Log completion metrics to SQLite
         save_run_metrics(self.total_scraped_count, self.total_reaction_count, total_elapsed)
 
-        # Output Run Summary
         print("\n" + "="*50)
         print("              RUN TIME SUMMARY               ")
         print("="*50)
