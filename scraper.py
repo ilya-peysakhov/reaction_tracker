@@ -73,16 +73,28 @@ class IGNScraper:
                 await asyncio.sleep(2 ** attempt)
         return None
 
-    async def get_board_threads_async(self, board_url: str, max_pages: int = 1) -> List[str]:
+    async def get_board_threads_async(
+        self, 
+        board_url: str, 
+        page: Optional[int] = None, 
+        max_pages: int = 1
+    ) -> List[str]:
         """
         Asynchronously parses forum index pages and collects individual thread URLs.
+        Supports single page targets via `page` or a sequence using `max_pages`.
         """
         discovered_urls: List[str] = []
         
+        # Determine target page numbers
+        if page is not None:
+            pages_to_fetch = [page]
+        else:
+            pages_to_fetch = list(range(1, max_pages + 1))
+
         async with aiohttp.ClientSession() as session:
-            for page in range(1, max_pages + 1):
-                page_url = f"{board_url.rstrip('/')}/page-{page}" if page > 1 else board_url
-                logging.info(f"Discovering threads on forum page {page}: {page_url}")
+            for p in pages_to_fetch:
+                page_url = f"{board_url.rstrip('/')}/page-{p}" if p > 1 else board_url
+                logging.info(f"Discovering threads on forum page {p}: {page_url}")
                 
                 html = await self.fetch_page(session, page_url)
                 if not html:
@@ -104,11 +116,17 @@ class IGNScraper:
         logging.info(f"Discovered {len(discovered_urls)} unique thread URLs.")
         return discovered_urls
 
-    def get_board_threads(self, board_url: str, max_pages: int = 1) -> List[str]:
+    def get_board_threads(
+        self, 
+        board_url: str, 
+        page: Optional[int] = None, 
+        max_pages: int = 1
+    ) -> List[str]:
         """
         Synchronous wrapper for discovering threads on board index pages.
+        Accepts both `page` and `max_pages` keyword arguments.
         """
-        return asyncio.run(self.get_board_threads_async(board_url, max_pages))
+        return asyncio.run(self.get_board_threads_async(board_url, page=page, max_pages=max_pages))
 
     def parse_reactions(self, html: str, thread_id: str) -> List[Tuple[str, str, str, str]]:
         """Parses IGN Boards post HTML and extracts post IDs, usernames, and reaction types."""
@@ -228,6 +246,3 @@ class IGNScraper:
 
 if __name__ == "__main__":
     scraper = IGNScraper()
-    # Example usage:
-    # threads = scraper.get_board_threads("https://boards.ign.com/forums/the-vestibule.5296/", max_pages=2)
-    # scraper.run(threads)
