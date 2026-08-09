@@ -29,6 +29,9 @@ class IGNScraper:
     bounded concurrency, and session batching to avoid late-run slowdowns.
     """
     def __init__(self, thread_urls: Optional[List[str]] = None):
+        # Ensure tables and indexes exist BEFORE querying the DB
+        init_db()
+        
         self.thread_urls: List[str] = thread_urls if thread_urls else []
         self.scraped_set: Set[str] = get_already_scraped_ids()
         self.semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
@@ -77,7 +80,6 @@ class IGNScraper:
         for post in posts:
             post_id = post.get("data-content", "unknown")
             if post_id == "unknown":
-                # Fallback to post element ID if attribute missing
                 post_id = post.get("id", "unknown")
             
             # Extract reaction list links/nodes
@@ -129,7 +131,6 @@ class IGNScraper:
 
     async def run_async(self, thread_urls: Optional[List[str]] = None):
         """Asynchronous execution engine with session rotation per batch."""
-        init_db()
         target_urls = thread_urls if thread_urls is not None else self.thread_urls
         unscraped_urls = [u for u in target_urls if u.rstrip("/").split("/")[-1] not in self.scraped_set]
         total_remaining = len(unscraped_urls)
