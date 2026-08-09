@@ -1,6 +1,7 @@
 # config.py
 import os
 
+BASE_URL = "https://www.ignboards.com"
 # Scraper Settings
 CONCURRENT_REQUESTS = 5      # Number of threads to scrape simultaneously
 BATCH_SIZE = 50              # Refresh session & flush memory after N threads
