@@ -30,7 +30,7 @@ class IGNScraper:
     Async scraper for IGN Boards reaction tracking. Handles forum discovery, 
     reverse pagination, bounded concurrency, and session batching.
     """
-    BASE_URL = "https://boards.ign.com"
+    BASE_URL = "https://www.ignboards.com"
 
     def __init__(self, thread_urls: Optional[List[str]] = None):
         # Ensure database and tables exist before loading scraped IDs
