@@ -56,7 +56,8 @@ class IGNScraper:
     @staticmethod
     def parse_time(time_tag: Optional[Tag]) -> Optional[datetime]:
         """
-        Parses XenForo/IGN timestamp tags (<time datetime="..."> or <time data-time="...">).
+        Parses XenForo/IGN timestamp tags (<time datetime="..."> or <time data-time="...">)
+        and returns a naive datetime (UTC) for safe comparison against standard datetimes.
         """
         if not time_tag:
             return None
@@ -66,13 +67,20 @@ class IGNScraper:
             return None
             
         try:
-            # Handle numeric epoch timestamp string
+            dt = None
+            # Handle numeric Unix epoch timestamp (e.g. data-time="1710000000")
             if str(dt_str).isdigit():
-                return datetime.fromtimestamp(int(dt_str))
-            
-            # ISO 8601 parsing
-            dt_str_clean = str(dt_str).replace("Z", "+00:00")
-            return datetime.fromisoformat(dt_str_clean)
+                dt = datetime.fromtimestamp(int(dt_str))
+            else:
+                # ISO 8601 parsing (e.g. "2026-08-01T12:00:00+00:00")
+                dt_str_clean = str(dt_str).replace("Z", "+00:00")
+                dt = datetime.fromisoformat(dt_str_clean)
+                
+            # Strip timezone info so it can be compared with naive cutoff_date instances
+            if dt and dt.tzinfo is not None:
+                dt = dt.replace(tzinfo=None)
+                
+            return dt
         except Exception:
             return None
 
