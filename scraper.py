@@ -82,7 +82,10 @@ class IGNScraper:
             return None
 
     async def fetch_page(self, session: aiohttp.ClientSession, url: str) -> Optional[str]:
-        """Fetches page content with exponential backoff on retries or 429s, exiting immediately on 404."""
+        """
+        Fetches page content with exponential backoff on retries or 429s.
+        Exits IMMEDIATELY without retrying on 404 (Not Found) or 403 (Forbidden).
+        """
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 async with self.semaphore:
@@ -90,20 +93,24 @@ class IGNScraper:
                     async with session.get(url, headers=self._get_headers(), timeout=TIMEOUT_SECONDS) as resp:
                         if resp.status == 200:
                             return await resp.text()
-                        elif resp.status == 404:
-                            # Instant return on 404 to skip non-existent/deleted pages cleanly
-                            logging.debug(f"HTTP 404 for {url}")
+                        
+                        # FAST-FAIL: Do not retry permanent client errors (404/403)
+                        elif resp.status in (404, 403):
+                            logging.warning(f"HTTP {resp.status} for {url}. Fast-failing without retries.")
                             return None
+                            
                         elif resp.status == 429:
                             backoff = (2 ** attempt) + random.uniform(0, 1)
                             logging.warning(f"Rate limited (429) on {url}. Retrying in {backoff:.2f}s...")
                             await asyncio.sleep(backoff)
                         else:
                             logging.warning(f"HTTP {resp.status} for {url}")
+                            
             except (aiohttp.ClientError, asyncio.TimeoutError) as err:
                 if attempt == MAX_RETRIES:
                     logging.error(f"Failed to fetch {url} after {MAX_RETRIES} attempts: {err}")
                 await asyncio.sleep(2 ** attempt)
+                
         return None
 
     async def get_board_threads_async(
@@ -220,7 +227,7 @@ class IGNScraper:
             if last_page is None:
                 first_page_html = await self.fetch_page(session, thread_url)
                 if not first_page_html:
-                    logging.warning(f"Thread {thread_id} returned 404 on initial fetch. Skipping deleted thread.")
+                    logging.warning(f"Thread {thread_id} returned 404/403 on initial fetch. Skipping deleted thread.")
                     return []
 
                 soup = BeautifulSoup(first_page_html, "html.parser")
@@ -253,7 +260,7 @@ class IGNScraper:
                         first_page_html = await self.fetch_page(session, thread_url)
                         
                         if not first_page_html:
-                            logging.warning(f"Thread {thread_id} Page 1 inaccessible (404). Aborting.")
+                            logging.warning(f"Thread {thread_id} Page 1 inaccessible (404/403). Aborting.")
                             break
                         
                         soup = BeautifulSoup(first_page_html, "html.parser")
@@ -390,7 +397,7 @@ class IGNScraper:
         save_run_metrics(self.total_scraped_count, self.total_reaction_count, total_elapsed)
 
         print("\n" + "="*50)
-        print("              RUN TIME SUMMARY               ")
+        print("               RUN TIME SUMMARY               ")
         print("="*50)
         print(f"Total Threads Processed: {self.total_scraped_count}")
         print(f"Total Reactions Extracted: {self.total_reaction_count}")
