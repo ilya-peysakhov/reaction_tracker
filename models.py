@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 @dataclass
@@ -29,18 +29,27 @@ class AggregatedMetrics:
     total_posts: int = 0
     total_reactions: int = 0
 
-
 @dataclass
 class Post:
     thread_id: str
     post_id: str
-    giver_username: str                         # User who gave the reaction
-    author_username: str                        # User who wrote the post (Getter)
+    username: str                                   # Giver of reaction
+    author: Optional[str] = None                    # Author of the post
     reaction_type: str = "Like"
     reaction_count: int = 1
     post_date: Optional[datetime] = None
     thread_title: Optional[str] = None
-    text_content: Optional[str] = None
+    text_content: Optional[str] = None              # Raw post body if scraped
+
+    def __post_init__(self):
+        # NOTE: this used to fall back to `self.username` (the reactor) when
+        # `author` was missing, which silently made "post author" and
+        # "person who reacted" the same person. The scraper now always
+        # supplies the real author when it can find one; if it genuinely
+        # can't, "Unknown" is used instead so bad data is visible rather
+        # than quietly corrupting the "top reaction getters" aggregation.
+        if not self.author:
+            self.author = "Unknown"
 
     @property
     def content_snippet(self) -> str:
@@ -60,4 +69,4 @@ class Post:
     @property
     def reactors(self) -> List[str]:
         """List of reaction givers for UI display."""
-        return [self.giver_username] if self.giver_username else []
+        return [self.username] if self.username else []

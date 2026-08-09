@@ -222,55 +222,64 @@ class IGNScraper:
             return full_url.split("page-")[0].split("#")[0].rstrip("/")
         return None
 
-     def parse_reactions(self, html: str, thread_id: str) -> List[Post]:
-            """Parses XenForo post HTML, mapping post authors vs reaction givers correctly."""
-            soup = BeautifulSoup(html, "html.parser")
-            reactions: List[Post] = []
-    
-            posts = soup.select("article.message, div.message-inner")
-            for post in posts:
-                post_id = post.get("data-content") or post.get("id") or "unknown"
-                if "post-" in str(post_id):
-                    post_id = str(post_id).replace("post-", "")
-    
-                time_tag = post.select_one("time")
-                post_dt = self.parse_time(time_tag)
-    
-                # 1. EXTRACT POST AUTHOR (GETTER)
-                post_author = post.get("data-author")
-                if not post_author:
-                    author_tag = post.select_one("a.username, .message-user text, [data-user-id]")
-                    post_author = author_tag.text.strip() if author_tag else "UnknownAuthor"
-    
-                # Extract raw post body content if present
-                body_tag = post.select_one(".message-body, .js-selectToQuote")
-                text_content = body_tag.get_text(strip=True) if body_tag else None
-    
-                # 2. EXTRACT REACTION GIVERS
-                reaction_nodes = post.select(".reactionsBar-link a, .sv-rate-type")
-                
-                for node in reaction_nodes:
-                    giver_name = node.text.strip()
-                    reaction_type = node.get("title", "Like")
-    
-                    # Filter out generic summary labels like "12 others" or "and 2 more..."
-                    if "other" in giver_name.lower() or "more" in giver_name.lower():
-                        continue
-    
-                    reactions.append(
-                        Post(
-                            thread_id=thread_id,
-                            post_id=post_id,
-                            giver_username=giver_name,
-                            author_username=post_author,
-                            reaction_type=reaction_type,
-                            reaction_count=1,
-                            post_date=post_dt,
-                            text_content=text_content
-                        )
+    def parse_reactions(self, html: str, thread_id: str) -> List[Post]:
+        """Parses IGN Boards post HTML and returns mutable Post objects.
+
+        IMPORTANT: `div.message-inner` is nested *inside* `article.message`
+        in XenForo's markup. Selecting both in one CSS query
+        (`"article.message, div.message-inner"`) does NOT dedupe the
+        parent/child pair -- BeautifulSoup/soupsieve returns them as two
+        distinct nodes, so every post used to get processed twice and every
+        reaction counted twice. Only the outer `article.message` is
+        selected here.
+
+        This also now extracts the post's actual *author* (`data-author`)
+        -- previously this was never scraped, so `Post.author` silently
+        fell back to the reactor's username, which made "top reaction
+        getters" a duplicate of "top reaction givers".
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        reactions: List[Post] = []
+
+        posts = soup.select("article.message")
+        for post in posts:
+            post_id = post.get("data-content", "unknown")
+            if post_id == "unknown":
+                post_id = post.get("id", "unknown")
+
+            # The person who WROTE the post -- distinct from anyone who
+            # reacted to it. XenForo puts this on the article element.
+            post_author = post.get("data-author") or "Unknown"
+
+            time_tag = post.select_one("time")
+            post_dt = self.parse_time(time_tag)
+
+            # Best-effort snippet of the post body, for nicer summaries.
+            body_tag = post.select_one(".message-body .bbWrapper, .message-body")
+            text_content = body_tag.get_text(" ", strip=True) if body_tag else None
+
+            reaction_nodes = post.select(".reactionsBar-link, .sv-rate-type")
+            for node in reaction_nodes:
+                user_name = node.text.strip()
+                reaction_type = node.get("title", "Like")
+
+                if not user_name:
+                    continue
+
+                reactions.append(
+                    Post(
+                        thread_id=thread_id,
+                        post_id=post_id,
+                        username=user_name,
+                        author=post_author,
+                        reaction_type=reaction_type,
+                        reaction_count=1,
+                        post_date=post_dt,
+                        text_content=text_content,
                     )
-    
-            return reactions
+                )
+                
+        return reactions
 
     async def scrape_thread_backwards_async(
         self, 
@@ -379,33 +388,34 @@ class IGNScraper:
             )
         )
 
-      async def process_thread(self, session: aiohttp.ClientSession, url: str):
+    async def process_thread(self, session: aiohttp.ClientSession, url: str):
         """Scrapes a single thread URL and measures execution time."""
         thread_id = url.rstrip("/").split("/")[-1]
-
+        
         if thread_id in self.scraped_set:
             return
 
         thread_start_time = time.perf_counter()
         html = await self.fetch_page(session, url)
-
+        
         if html:
             extracted = self.parse_reactions(html, thread_id)
             thread_duration = time.perf_counter() - thread_start_time
-
+            
+            # Convert Post instances to tuple format expected by save_batch_results
             for post in extracted:
-                self.pending_reactions.append(
-                    (post.thread_id, post.post_id, post.giver_username, post.author_username, post.reaction_type)
-                )
-
+                self.pending_reactions.append((post.thread_id, post.post_id, post.username, post.reaction_type))
+                
             self.pending_scraped_ids.append(thread_id)
             self.scraped_set.add(thread_id)
-
+            
             self.total_scraped_count += 1
             self.total_reaction_count += len(extracted)
 
             logging.info(
-                f"Scraped {thread_id} | Time: {thread_duration:.2f}s | Reactions: {len(extracted)}"
+                f"Scraped {thread_id} | "
+                f"Time: {thread_duration:.2f}s | "
+                f"Reactions: {len(extracted)}"
             )
 
             if len(self.pending_scraped_ids) >= DB_COMMIT_INTERVAL:
