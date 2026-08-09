@@ -2,12 +2,53 @@
 import asyncio
 import time
 import random
+import re
 import logging
 import aiohttp
 from datetime import datetime
 from bs4 import BeautifulSoup, Tag
 from typing import List, Tuple, Optional, Set, Union
 from urllib.parse import urljoin
+
+# XenForo's reaction bar is typically ONE summary element per post
+# (`.reactionsBar-link`) whose visible text is a human-readable sentence
+# like "Alice, Bob and Carol reacted to this message" -- not one DOM node
+# per reactor. Treating that whole sentence as a single username (the
+# original bug) makes a post with 3 reactors register as exactly 1
+# reaction. These helpers turn that sentence back into individual names,
+# plus a count of any anonymous overflow once the list gets truncated to
+# "Alice, Bob and 3 others".
+_REACTED_SUFFIX_RE = re.compile(r"\s*reacted(\s+to\s+this\s+(message|post))?\.?\s*$", re.IGNORECASE)
+_OTHERS_RE = re.compile(r"^(\d+)\s+others?$", re.IGNORECASE)
+
+
+def _split_reactor_text(raw_text: Optional[str]) -> Tuple[List[str], int]:
+    """Splits a reaction-summary string into (named_reactors, anonymous_count).
+
+    Safe no-op for a string that's already just a single username -- it
+    comes back as a one-item list with 0 anonymous, so this also works
+    correctly for themes/addons that DO render one node per reactor.
+    """
+    if not raw_text:
+        return [], 0
+
+    text = _REACTED_SUFFIX_RE.sub("", raw_text.strip())
+    text = re.sub(r"\s*&\s*", ", ", text)
+    text = re.sub(r"\s+and\s+", ", ", text)
+
+    names: List[str] = []
+    anonymous = 0
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        m = _OTHERS_RE.match(chunk)
+        if m:
+            anonymous += int(m.group(1))
+        else:
+            names.append(chunk)
+
+    return names, anonymous
 
 try:
     from config import (
@@ -260,25 +301,46 @@ class IGNScraper:
 
             reaction_nodes = post.select(".reactionsBar-link, .sv-rate-type")
             for node in reaction_nodes:
-                user_name = node.text.strip()
+                raw_text = node.get_text(" ", strip=True)
                 reaction_type = node.get("title", "Like")
 
-                if not user_name:
-                    continue
+                names, anonymous_count = _split_reactor_text(raw_text)
 
-                reactions.append(
-                    Post(
-                        thread_id=thread_id,
-                        post_id=post_id,
-                        username=user_name,
-                        author=post_author,
-                        reaction_type=reaction_type,
-                        reaction_count=1,
-                        post_date=post_dt,
-                        text_content=text_content,
+                for user_name in names:
+                    reactions.append(
+                        Post(
+                            thread_id=thread_id,
+                            post_id=post_id,
+                            username=user_name,
+                            author=post_author,
+                            reaction_type=reaction_type,
+                            reaction_count=1,
+                            post_date=post_dt,
+                            text_content=text_content,
+                        )
                     )
-                )
-                
+
+                # Once XenForo truncates the summary to "...and N others" we
+                # can't recover those individual names, but we can still
+                # count them toward the post's total reaction count.
+                # username="" makes Post.reactors == [] so this row is
+                # correctly excluded from the "top givers" leaderboard
+                # (we don't know who they are) while still counting toward
+                # "top getters" and "most reacted posts" totals.
+                if anonymous_count > 0:
+                    reactions.append(
+                        Post(
+                            thread_id=thread_id,
+                            post_id=post_id,
+                            username="",
+                            author=post_author,
+                            reaction_type=reaction_type,
+                            reaction_count=anonymous_count,
+                            post_date=post_dt,
+                            text_content=text_content,
+                        )
+                    )
+
         return reactions
 
     async def scrape_thread_backwards_async(
