@@ -322,7 +322,7 @@ def main():
     if most_reacted_posts:
         for idx, post in enumerate(most_reacted_posts[:5], 1):
             with st.expander(f"#{idx} — {post.author} ({post.reaction_count} reactions) in '{post.thread_title}'"):
-                st.write(post.content_snippet)
+                st.write(post.content_snippet or f"Post ID: {post.post_url}")
                 if post.reactors:
                     st.caption(f"**Reactors:** {', '.join(post.reactors)}")
                 st.markdown(f"[View Original Post]({post.post_url})")
