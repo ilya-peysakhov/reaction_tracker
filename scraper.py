@@ -68,15 +68,12 @@ class IGNScraper:
             
         try:
             dt = None
-            # Handle numeric Unix epoch timestamp (e.g. data-time="1710000000")
             if str(dt_str).isdigit():
                 dt = datetime.fromtimestamp(int(dt_str))
             else:
-                # ISO 8601 parsing (e.g. "2026-08-01T12:00:00+00:00")
                 dt_str_clean = str(dt_str).replace("Z", "+00:00")
                 dt = datetime.fromisoformat(dt_str_clean)
                 
-            # Strip timezone info so it can be compared with naive cutoff_date instances
             if dt and dt.tzinfo is not None:
                 dt = dt.replace(tzinfo=None)
                 
@@ -131,7 +128,6 @@ class IGNScraper:
                 soup = BeautifulSoup(html, "html.parser")
                 
                 if return_elements:
-                    # Select XenForo thread row elements directly
                     thread_rows = soup.select(".structItem--thread, div.structItem")
                     discovered_items.extend(thread_rows)
                 else:
@@ -154,8 +150,7 @@ class IGNScraper:
         return_elements: bool = True
     ) -> Union[List[Tag], List[str]]:
         """
-        Synchronous wrapper for discovering board threads. 
-        Returns BeautifulSoup Tag elements by default so callers can call `.select_one()`.
+        Synchronous wrapper for discovering board threads.
         """
         return asyncio.run(
             self.get_board_threads_async(board_url, page=page, max_pages=max_pages, return_elements=return_elements)
@@ -188,6 +183,77 @@ class IGNScraper:
                 reactions.append((thread_id, post_id, user_name, reaction_type))
                 
         return reactions
+
+    async def scrape_thread_backwards_async(
+        self, 
+        thread_url: str, 
+        cutoff_date: Optional[datetime] = None
+    ) -> List[Tuple[str, str, str, str]]:
+        """
+        Asynchronously fetches thread pages in reverse order starting from the last page
+        down to page 1, optionally stopping if posts fall before `cutoff_date`.
+        """
+        thread_id = thread_url.rstrip("/").split("/")[-1]
+        all_reactions = []
+
+        async with aiohttp.ClientSession() as session:
+            # 1. Fetch initial thread landing page (page 1) to inspect total pagination count
+            first_page_html = await self.fetch_page(session, thread_url)
+            if not first_page_html:
+                return []
+
+            soup = BeautifulSoup(first_page_html, "html.parser")
+            
+            # Extract total number of pages from XenForo pagination nav
+            page_nav = soup.select("ul.pageNav-main li.pageNav-page, nav.pageNav li.pageNav-page")
+            last_page = 1
+            if page_nav:
+                try:
+                    page_numbers = [int(p.text.strip()) for p in page_nav if p.text.strip().isdigit()]
+                    if page_numbers:
+                        last_page = max(page_numbers)
+                except ValueError:
+                    last_page = 1
+
+            logging.info(f"Thread {thread_id} has {last_page} page(s). Scraping backwards...")
+
+            # 2. Iterate backwards from last_page down to 1
+            for p in range(last_page, 0, -1):
+                page_url = f"{thread_url.rstrip('/')}/page-{p}" if p > 1 else thread_url
+                
+                # Use cached page 1 HTML if we reached page 1
+                if p == 1:
+                    html = first_page_html
+                else:
+                    html = await self.fetch_page(session, page_url)
+
+                if not html:
+                    continue
+
+                page_soup = BeautifulSoup(html, "html.parser")
+                page_reactions = self.parse_reactions(html, thread_id)
+                all_reactions.extend(page_reactions)
+
+                # Check oldest post on page against cutoff_date if set
+                if cutoff_date:
+                    time_tags = page_soup.select("article.message time, div.message time")
+                    if time_tags:
+                        oldest_time = self.parse_time(time_tags[0]) # First message on page
+                        if oldest_time and oldest_time < cutoff_date:
+                            logging.info(f"Reached cutoff date on page {p} of thread {thread_id}. Stopping pagination.")
+                            break
+
+        return all_reactions
+
+    def scrape_thread_backwards(
+        self, 
+        thread_url: str, 
+        cutoff_date: Optional[datetime] = None
+    ) -> List[Tuple[str, str, str, str]]:
+        """
+        Synchronous wrapper for reverse-pagination thread scraping.
+        """
+        return asyncio.run(self.scrape_thread_backwards_async(thread_url, cutoff_date=cutoff_date))
 
     async def process_thread(self, session: aiohttp.ClientSession, url: str):
         """Scrapes a single thread URL and measures execution time."""
