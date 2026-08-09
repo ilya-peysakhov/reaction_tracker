@@ -6,6 +6,7 @@ import logging
 import aiohttp
 from bs4 import BeautifulSoup
 from typing import List, Tuple, Optional, Set
+from urllib.parse import urljoin
 
 from config import (
     CONCURRENT_REQUESTS, 
@@ -25,11 +26,13 @@ logging.basicConfig(
 
 class IGNScraper:
     """
-    Async scraper for IGN Boards reaction tracking. Handles reverse pagination, 
-    bounded concurrency, and session batching to avoid late-run slowdowns.
+    Async scraper for IGN Boards reaction tracking. Handles forum discovery, 
+    reverse pagination, bounded concurrency, and session batching.
     """
+    BASE_URL = "https://boards.ign.com"
+
     def __init__(self, thread_urls: Optional[List[str]] = None):
-        # Ensure tables and indexes exist BEFORE querying the DB
+        # Ensure database and tables exist before loading scraped IDs
         init_db()
         
         self.thread_urls: List[str] = thread_urls if thread_urls else []
@@ -70,19 +73,54 @@ class IGNScraper:
                 await asyncio.sleep(2 ** attempt)
         return None
 
+    async def get_board_threads_async(self, board_url: str, max_pages: int = 1) -> List[str]:
+        """
+        Asynchronously parses forum index pages and collects individual thread URLs.
+        """
+        discovered_urls: List[str] = []
+        
+        async with aiohttp.ClientSession() as session:
+            for page in range(1, max_pages + 1):
+                page_url = f"{board_url.rstrip('/')}/page-{page}" if page > 1 else board_url
+                logging.info(f"Discovering threads on forum page {page}: {page_url}")
+                
+                html = await self.fetch_page(session, page_url)
+                if not html:
+                    continue
+                
+                soup = BeautifulSoup(html, "html.parser")
+                # XenForo / IGN Boards thread title link selectors
+                thread_links = soup.select("div.structItem-title a[data-tp-primary], a[href*='/threads/']")
+                
+                for link in thread_links:
+                    href = link.get("href")
+                    if href and "/threads/" in href:
+                        full_url = urljoin(self.BASE_URL, href)
+                        # Clean off page query parameters or post anchors
+                        clean_url = full_url.split("page-")[0].split("#")[0].rstrip("/")
+                        if clean_url not in discovered_urls:
+                            discovered_urls.append(clean_url)
+                            
+        logging.info(f"Discovered {len(discovered_urls)} unique thread URLs.")
+        return discovered_urls
+
+    def get_board_threads(self, board_url: str, max_pages: int = 1) -> List[str]:
+        """
+        Synchronous wrapper for discovering threads on board index pages.
+        """
+        return asyncio.run(self.get_board_threads_async(board_url, max_pages))
+
     def parse_reactions(self, html: str, thread_id: str) -> List[Tuple[str, str, str, str]]:
         """Parses IGN Boards post HTML and extracts post IDs, usernames, and reaction types."""
         soup = BeautifulSoup(html, "html.parser")
         reactions = []
         
-        # IGN Boards / XenForo post container selectors
         posts = soup.select("article.message, div.message-inner")
         for post in posts:
             post_id = post.get("data-content", "unknown")
             if post_id == "unknown":
                 post_id = post.get("id", "unknown")
             
-            # Extract reaction list links/nodes
             reaction_nodes = post.select(".reactionsBar-link, .sv-rate-type")
             for node in reaction_nodes:
                 user_name = node.text.strip()
@@ -149,7 +187,6 @@ class IGNScraper:
             
             logging.info(f"--- Batch {batch_num} Starting ({len(batch_urls)} threads) ---")
             
-            # Create a clean ClientSession per batch to reset TCP connection pools and memory
             async with aiohttp.ClientSession() as session:
                 tasks = [self.process_thread(session, url) for url in batch_urls]
                 await asyncio.gather(*tasks)
@@ -170,10 +207,10 @@ class IGNScraper:
         avg_per_thread = total_elapsed / self.total_scraped_count if self.total_scraped_count > 0 else 0
         threads_per_min = (self.total_scraped_count / (total_elapsed / 60.0)) if total_elapsed > 0 else 0
 
-        # Log completion metrics to SQLite database
+        # Log completion metrics to SQLite
         save_run_metrics(self.total_scraped_count, self.total_reaction_count, total_elapsed)
 
-        # Output Run Metrics
+        # Output Run Summary
         print("\n" + "="*50)
         print("              RUN TIME SUMMARY               ")
         print("="*50)
@@ -190,6 +227,7 @@ class IGNScraper:
 
 
 if __name__ == "__main__":
-    sample_urls = [f"https://boards.ign.com/threads/sample-thread-{i}" for i in range(1, 100)]
-    scraper = IGNScraper(sample_urls)
-    scraper.run()
+    scraper = IGNScraper()
+    # Example usage:
+    # threads = scraper.get_board_threads("https://boards.ign.com/forums/the-vestibule.5296/", max_pages=2)
+    # scraper.run(threads)
