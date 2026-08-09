@@ -192,7 +192,7 @@ class IGNScraper:
     ) -> List[Tuple[str, str, str, str]]:
         """
         Asynchronously fetches thread pages in reverse order.
-        Uses initial_max_page as a fast-path, with auto-fallback to Page 1 on 404s.
+        Safely handles 404s on deleted threads and avoids recursive fallback loops.
         """
         thread_id = thread_url.rstrip("/").split("/")[-1]
         all_reactions = []
@@ -201,10 +201,12 @@ class IGNScraper:
             first_page_html = None
             last_page = initial_max_page
     
-            # 1. Discover max page from Page 1 if not provided
+            # 1. Discover max page from Page 1 if initial_max_page was not passed
             if last_page is None:
                 first_page_html = await self.fetch_page(session, thread_url)
+                # If Page 1 returns 404, the thread is deleted/inaccessible. Abort immediately.
                 if not first_page_html:
+                    logging.warning(f"Thread {thread_id} returned 404 on initial fetch. Skipping deleted thread.")
                     return []
     
                 soup = BeautifulSoup(first_page_html, "html.parser")
@@ -226,12 +228,21 @@ class IGNScraper:
                 else:
                     html = await self.fetch_page(session, page_url)
     
-                # Handle 404 or missing HTML on initial max page attempt
+                # Handle 404 or failed page fetches
                 if not html:
+                    # If Page 1 specifically fails during reverse iteration, the thread is deleted
+                    if p == 1:
+                        logging.warning(f"Thread {thread_id} Page 1 returned 404. Skipping remaining processing.")
+                        break
+    
+                    # If a high page (e.g., page 438) returns 404, check Page 1 ONCE to re-anchor
                     if p == last_page and initial_max_page is not None:
-                        logging.info(f"Page {p} returned 404. Checking Page 1 for accurate max page...")
+                        logging.info(f"Page {p} returned 404. Checking Page 1 for actual thread max page...")
                         first_page_html = await self.fetch_page(session, thread_url)
+                        
+                        # Page 1 failed -> Thread is deleted
                         if not first_page_html:
+                            logging.warning(f"Thread {thread_id} Page 1 is inaccessible (404). Aborting.")
                             break
                         
                         soup = BeautifulSoup(first_page_html, "html.parser")
@@ -243,11 +254,16 @@ class IGNScraper:
                             if page_numbers:
                                 real_last_page = max(page_numbers)
                         
+                        # Avoid infinite recursion: only restart if real_last_page is strictly lower than p
                         if real_last_page < last_page:
                             logging.info(f"Corrected max page from {last_page} -> {real_last_page}. Re-anchoring sequence.")
                             return await self.scrape_thread_backwards_async(
                                 thread_url, cutoff_date=cutoff_date, initial_max_page=real_last_page
                             )
+                        else:
+                            logging.warning(f"Could not resolve valid pages for {thread_id}. Skipping.")
+                            break
+    
                     continue
     
                 page_soup = BeautifulSoup(html, "html.parser")
