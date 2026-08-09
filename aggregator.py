@@ -8,14 +8,21 @@ class MetricsAggregator:
         self.posts = posts
         self.threads = threads
 
-    def get_top_reaction_givers(self, limit: int = 10) -> List[Tuple[str, int]]:
-        """
-        Counts reactions given by user across all scraped posts.
-        """
+    def get_top_reaction_givers(self, limit: int = 10):
+        """Calculates users who gave the most reactions."""
         giver_counts = Counter()
         for post in self.posts:
-            for reactor in post.reactors:
-                giver_counts[reactor] += 1
+            # Check if post has a 'reactors' list or if post.username is the giver
+            if hasattr(post, "reactors") and post.reactors:
+                for reactor in post.reactors:
+                    giver_counts[reactor] += 1
+            elif hasattr(post, "username") and post.username:
+                giver_counts[post.username] += 1
+            elif isinstance(post, dict):
+                user = post.get("username")
+                if user:
+                    giver_counts[user] += 1
+                    
         return giver_counts.most_common(limit)
 
     def get_top_reaction_getters(self, limit: int = 10) -> List[Tuple[str, int]]:
