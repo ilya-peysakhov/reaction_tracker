@@ -21,6 +21,21 @@ st.set_page_config(
 
 
 # ==============================================================================
+# CACHED THREAD FETCH HELPER
+# ==============================================================================
+@st.cache_data(ttl=86400, show_spinner=False)
+def _fetch_single_thread(full_url: str, cutoff_date: datetime, last_page: int):
+    """
+    Fetches and parses a single thread. Cached by Streamlit for 24 hours (86,400s).
+    Subsequent runs with the same parameters will immediately return cached posts.
+    """
+    scraper = IGNScraper()
+    return scraper.scrape_thread_backwards(
+        full_url, cutoff_date, initial_max_page=last_page
+    )
+
+
+# ==============================================================================
 # FORUM POSTER MODULE
 # ==============================================================================
 class IGNForumPoster:
@@ -106,7 +121,8 @@ class IGNForumPoster:
 def run_board_scraper(board_url: str, days_back: int, max_threads_limit: int = None, progress_callback=None):
     """
     Crawls board pages sequentially (page 1, 2, 3...) fetching threads until 
-    reaching the cutoff date or max thread limit.
+    reaching the cutoff date or max thread limit. Uses @st.cache_data to skip 
+    refetching threads scraped in the last 24 hours.
     """
     scraper = IGNScraper()
     cutoff_date = datetime.now() - timedelta(days=days_back)
@@ -151,10 +167,8 @@ def run_board_scraper(board_url: str, days_back: int, max_threads_limit: int = N
                 if last_link_text.isdigit():
                     last_page = int(last_link_text)
 
-            # Scrape thread posts backwards from the last page
-            posts = scraper.scrape_thread_backwards(
-                full_url, cutoff_date, initial_max_page=last_page
-            )
+            # Scrape or retrieve cached thread posts (TTL: 24h)
+            posts = _fetch_single_thread(full_url, cutoff_date, last_page)
 
             thread_reactions = 0
             for post in posts:
@@ -322,7 +336,7 @@ def main():
     if most_reacted_posts:
         for idx, post in enumerate(most_reacted_posts[:5], 1):
             with st.expander(f"#{idx} — {post.author} ({post.reaction_count} reactions) in '{post.thread_title}'"):
-                st.write(post.content_snippet or f"Post ID: {post.post_url}")
+                st.write(post.content_snippet)
                 if post.reactors:
                     st.caption(f"**Reactors:** {', '.join(post.reactors)}")
                 st.markdown(f"[View Original Post]({post.post_url})")
